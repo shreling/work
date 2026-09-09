@@ -1,0 +1,93 @@
+from datetime import datetime
+from pathlib import Path
+import win32com.client as win32
+from openpyxl import Workbook, load_workbook
+
+SHARED_MAILBOX = "mm_events@mediolanum.ie"
+TARGET_FOLDER = Path(r"C:\Users\shreya.lingam\Mediolanum International Funds\Multi Management - Travel&Conference")
+OUTPUT_FILE = TARGET_FOLDER / "MM_events_mailbox.xlsx"
+SHEET_NAME = "Inbox_Excel_Attachments"
+MAILBOX_NAME = "MM_events"
+
+
+def get_or_create_workbook(path: Path):
+    if path.exists():
+        wb = load_workbook(path)
+        ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.create_sheet(SHEET_NAME)
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = SHEET_NAME
+        ws.append(["Sender", "Subject"])
+
+    if ws.max_row == 1 and ws.cell(row=1, column=1).value is None:
+        ws.append(["Sender", "Subject"])
+
+    return wb, ws
+
+
+def find_mm_events_inbox(namespace):
+    """Look for the visible MM_events mailbox folder and return its Inbox."""
+    print("Outlook top-level folders:")
+    for folder in namespace.Folders:
+        print(" -", folder.Name)
+
+    for account_folder in namespace.Folders:
+        if MAILBOX_NAME.lower() in (account_folder.Name or "").lower():
+            try:
+                inbox = account_folder.Folders["Inbox"]
+                print(f"Found MM_events mailbox folder: {account_folder.Name}")
+                return inbox
+            except Exception:
+                pass
+
+        try:
+            for child in account_folder.Folders:
+                if MAILBOX_NAME.lower() in (child.Name or "").lower():
+                    try:
+                        inbox = child.Folders["Inbox"]
+                        print(f"Found nested MM_events mailbox folder: {child.Name}")
+                        return inbox
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    raise RuntimeError("MM_events mailbox Inbox not found in the loaded Outlook profile.")
+
+
+def scan_inbox_and_append():
+    TARGET_FOLDER.mkdir(parents=True, exist_ok=True)
+    wb, ws = get_or_create_workbook(OUTPUT_FILE)
+
+    outlook = win32.Dispatch("Outlook.Application")
+    namespace = outlook.GetNamespace("MAPI")
+
+    inbox = find_mm_events_inbox(namespace)
+    print(f"Scanning Inbox: {inbox.Name}")
+    items = inbox.Items
+    items.Sort("[ReceivedTime]", True)
+
+    total_items = 0
+    added_rows = 0
+
+    for item in items:
+        total_items += 1
+        if getattr(item, "Class", None) != 43:
+            continue
+
+        sender = str(getattr(item, "SenderName", "") or "")
+        subject = str(getattr(item, "Subject", "") or "")
+
+        ws.append([sender, subject])
+        added_rows += 1
+        print(f"Logged: {sender} | {subject}")
+
+    wb.save(OUTPUT_FILE)
+    print(f"Total email items scanned: {total_items}")
+    print(f"Rows appended: {added_rows}")
+    print(f"Output file: {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    scan_inbox_and_append()
