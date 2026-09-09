@@ -1,0 +1,108 @@
+
+import snowflake.connector
+
+import pandas as pd
+import numpy as np
+import sys
+import git
+import os
+import matplotlib.pyplot as plt
+from scipy.stats.mstats import winsorize
+from sklearn.preprocessing import MinMaxScaler
+import seaborn as sns
+ 
+email="shreya.lingam@mediolanum.ie"
+ 
+conn = snowflake.connector.connect(
+           account = "mediolanum-snowflake.privatelink",
+           user = email,
+           authenticator = "externalbrowser",
+           role = "PROD_MED_BUSINESS_ANALYST",
+           warehouse = "PROD_EDW_LOAD",
+           database = "FACTSET",
+           schema = "SYM_V1")
+ 
+cur = conn.cursor()
+
+# Query to fetch FYSM_ID data from Snowflake 
+
+fsym_id_query = f"""SELECT
+    sih.ISIN,
+    sih.FSYM_ID,
+    sih.START_DATE AS START_DATE_ISIN,
+    sc.CURRENCY,
+    sc.PROPER_NAME,
+    sc.FREF_LISTING_EXCHANGE,
+    sc.FSYM_REGIONAL_ID,
+    sc.FSYM_SECURITY_ID
+FROM FACTSET.SYM_V1.SYM_ISIN_HIST sih
+LEFT JOIN FACTSET.SYM_V1.SYM_COVERAGE sc
+    ON sih.FSYM_ID = sc.FSYM_SECURITY_ID
+WHERE
+    sc.FREF_SECURITY_TYPE = 'SHARE'
+    AND sc.FSYM_ID IN (
+        SELECT DISTINCT FSYM_PRIMARY_LISTING_ID
+        FROM FACTSET.SYM_V1.SYM_COVERAGE
+        WHERE REGIONAL_FLAG = 'TRUE'
+    )
+    AND sc.FSYM_REGIONAL_ID IN (
+        SELECT DISTINCT FSYM_PRIMARY_LISTING_ID
+        FROM FACTSET.SYM_V1.SYM_COVERAGE
+        WHERE SECURITY_FLAG = 'TRUE'
+    )
+AND
+    sc.ACTIVE_FLAG = 'TRUE'
+AND
+    sih.MOST_RECENT = 'TRUE'
+ORDER BY
+    sc.PROPER_NAME"""
+
+fsym_id = cur.execute(fsym_id_query)
+
+# Read data from excel from Sheet1 and store as df 
+
+df = pd.read_excel("C:\\Users\\shreya.lingam\\OneDrive - Mediolanum International Funds\\Desktop\\Working trading .xlsx", sheet_name="Sheet1")
+
+# Using the df create a new column in df called FSYM_ID and assign the value from the fsym_id query to it using the ISIN column as the key to match the data
+
+fsym_id_df = pd.DataFrame(fsym_id.fetchall(), columns=[col[0] for col in fsym_id.description])
+df = df.merge(fsym_id_df[['ISIN', 'FSYM_ID']], on='ISIN', how='left')
+
+
+# Query to fetch eps revision data 
+
+eps_revision_query = f""" SELECT
+FSYM_ID,
+CONS_START_DATE,
+CURRENCY,
+FE_UP,
+FE_DOWN,
+FE_NUM_EST
+FROM FACTSET.FE_V4.FE_BASIC_CONH_AF
+WHERE CONS_START_DATE > '2025-06-01'
+AND FE_NUM_EST > '5'
+ORDER BY CONS_START_DATE ASC"""
+
+eps_revision = cur.execute(eps_revision_query)
+eps_revision_df = pd.DataFrame(eps_revision.fetchall(), columns=[col[0] for col in cur.description])
+
+# Calculate the revision by FE_UP -FE_DOWN/ FE_NUM_EST and store it in a new column called REVISIONs
+
+eps_revision_df['REVISION'] = (eps_revision_df['FE_UP'] - eps_revision_df['FE_DOWN']) / eps_revision_df['FE_NUM_EST']
+
+# now wrtie code below to make a line chart the revisions for the FSYM_ID CSMTMQ-R
+
+# Filter the eps_revision_df for the FSYM_ID CSMTMQ-R
+csm_revision_df = eps_revision_df[eps_revision_df['FSYM_ID'] == 'PM3F9R-R']
+
+# Plot the line chart for the revisions over time greater than 2025-06-01
+
+plt.figure(figsize=(10, 6))
+sns.lineplot(data=csm_revision_df, x='CONS_START_DATE', y='REVISION', marker='o')
+plt.title('EPS Revisions for FSYM_ID XF9TK6-S Over Time')
+plt.xlabel('Consensus Start Date')
+plt.ylabel('EPS Revision')
+plt.xticks(rotation=45)
+plt.grid()
+plt.tight_layout()
+plt.show()

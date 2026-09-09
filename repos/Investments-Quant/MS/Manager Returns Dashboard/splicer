@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""
+Splice monthly Excel sheets into one combined sheet.
+
+Expected monthly sheet names: YYYY-MM (for example, 2026-01, 2026-02).
+
+Usage examples:
+	python MS/splicer "C:/path/to/workbook.xlsx"
+	python MS/splicer "C:/path/to/workbook.xlsx" --sheet-name All_Data
+	python MS/splicer "C:/path/to/workbook.xlsx" --output "C:/path/to/output.xlsx"
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+
+import pandas as pd
+
+
+MONTH_SHEET_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(
+		description="Combine all YYYY-MM sheets from an Excel file into one sheet."
+	)
+	parser.add_argument("input_file", type=Path, help="Path to the source .xlsx file")
+	parser.add_argument(
+		"--output",
+		type=Path,
+		default=None,
+		help=(
+			"Optional output .xlsx path. If omitted, writes a new sheet into the input file."
+		),
+	)
+	parser.add_argument(
+		"--sheet-name",
+		default="Spliced_Data",
+		help="Name of the combined output sheet (default: Spliced_Data)",
+	)
+	return parser.parse_args()
+
+
+def get_month_sheets(excel_file: Path) -> list[str]:
+	workbook = pd.ExcelFile(excel_file)
+	month_sheets = [name for name in workbook.sheet_names if MONTH_SHEET_PATTERN.match(name)]
+	return sorted(month_sheets)
+
+
+def splice_monthly_sheets(
+	excel_file: Path,
+	sheet_name: str,
+	output_file: Path | None = None,
+) -> tuple[pd.DataFrame, Path]:
+	month_sheets = get_month_sheets(excel_file)
+	if not month_sheets:
+		raise ValueError(
+			"No monthly sheets found. Expected sheet names like YYYY-MM (e.g., 2026-01)."
+		)
+
+	frames: list[pd.DataFrame] = []
+	for month_sheet in month_sheets:
+		df = pd.read_excel(excel_file, sheet_name=month_sheet)
+		frames.append(df)
+
+	combined = pd.concat(frames, ignore_index=True, sort=False)
+
+	if output_file is None:
+		# Write to the same workbook while keeping existing sheets.
+		with pd.ExcelWriter(
+			excel_file,
+			engine="openpyxl",
+			mode="a",
+			if_sheet_exists="replace",
+		) as writer:
+			combined.to_excel(writer, sheet_name=sheet_name, index=False)
+		return combined, excel_file
+
+	# Write to a separate workbook.
+	with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+		combined.to_excel(writer, sheet_name=sheet_name, index=False)
+	return combined, output_file
+
+
+def main() -> None:
+	args = parse_args()
+
+	if not args.input_file.exists():
+		raise FileNotFoundError(f"Input file not found: {args.input_file}")
+
+	combined, written_file = splice_monthly_sheets(
+		excel_file=args.input_file,
+		sheet_name=args.sheet_name,
+		output_file=args.output,
+	)
+
+	print(
+		f"Combined {len(combined):,} rows from monthly sheets into "
+		f"'{args.sheet_name}' in: {written_file}"
+	)
+
+
+if __name__ == "__main__":
+	main()
