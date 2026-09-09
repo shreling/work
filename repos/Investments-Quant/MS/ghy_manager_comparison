@@ -1,0 +1,2426 @@
+"""
+GHY Manager Responses — Consolidated Data Extraction
+=====================================================
+Reads the GHY Manager List tracker from the synced SharePoint folder,
+extracts headline statistics and FX/region/country breakdowns from each
+manager's response spreadsheet, and outputs a consolidated Excel + HTML
+report back into the same SharePoint folder.
+
+SETUP FOR NEW USERS
+-------------------
+1. Sync the SharePoint folder to your local machine:
+   - Go to: https://maml.sharepoint.com/sites/ManagerSelectionOverview2/Searches/Forms/GHY%20Manager%20Responses.aspx
+   - Click "Sync" in the toolbar — this syncs via OneDrive to your local machine
+   - The synced folder will appear under:
+     C:\\Users\\<YOUR_USERNAME>\\Mediolanum International Funds\\Manager Selection Overview - GHY Manager Responses
+
+2. If auto-detection fails, set SHAREPOINT_FOLDER below to your local synced path.
+
+3. Run:  python ghy_manager_consolidation.py
+
+Outputs (GHY_Manager_Consolidated.xlsx and .html) are saved directly into the
+SharePoint folder and will sync back automatically. Each run overwrites the
+previous version.
+"""
+
+import pandas as pd
+import openpyxl
+import os
+import html
+import base64
+from pathlib import Path
+from datetime import datetime
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  CONFIGURATION — Update this section if auto-detection fails       ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+# Set this to your local synced SharePoint path if auto-detection doesn't work.
+# Example: r'C:\Users\jane.smith\Mediolanum International Funds\Manager Selection Overview - GHY Manager Responses'
+SHAREPOINT_FOLDER = None  # None = auto-detect
+
+# Logo for HTML report — navy version preferred for gradient nav bar
+LOGO_PATH_CANDIDATES = [
+    Path(r'C:\Users') / os.getenv('USERNAME', '') / r'Downloads\medio_navy.png',
+    Path(r'C:\Users') / os.getenv('USERNAME', '') / r'source\repos\Investments-Quant\Dash\Assets\medio.png',
+    Path(r'C:\Users') / os.getenv('USERNAME', '') / r'Downloads\medio.png',
+]
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  END CONFIGURATION                                                 ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+
+SHAREPOINT_FOLDER_NAME = 'Manager Selection Overview - GHY Manager Responses'
+TRACKER_FILENAME = 'GHY - Manager List.xlsx'
+OUTPUT_EXCEL = 'GHY_Manager_Consolidated.xlsx'
+OUTPUT_HTML = 'GHY_Manager_Consolidated.html'
+
+HEADLINE_FIELDS = [
+    'Fund reference benchmark',
+    'Currency Hedging policy and approach to management',
+    'Yield To Maturity (%)',
+    'Option Adjusted Spread (bps)',
+    'Effective Duration (yrs)',
+    'Average Rating',
+    'Number of issues',
+    'Fund Domicile/Legal structure',
+    'Fund Legal Status (UCITS)',
+]
+
+# Normalise inconsistent labels across manager spreadsheets
+LABEL_MAP = {
+    'euro': 'EUR', 'eur': 'EUR', 'Euro': 'EUR',
+    'Euro*': 'EUR', 'euro*': 'EUR',
+    'usd': 'USD', 'Usd': 'USD',
+    'gbp': 'GBP', 'Gbp': 'GBP',
+    'Cash & Equivalents': 'Cash', 'cash': 'Cash', 'cash & equivalents': 'Cash',
+    'Others': 'Other', 'others': 'Other',
+    'US and Canada': 'N. America', 'North America': 'N. America',
+    'USA': 'US', 'United States': 'US', 'United States of America': 'US',
+    'Australasia': 'Asia Pacific',
+    'Asia': 'Asia Pacific',
+    'asia': 'Asia Pacific',
+    'Asia Pac': 'Asia Pacific',
+}
+
+# Manual entries for managers who provided data via email (no Excel file)
+# These get included in headline stats but not in FX breakdown tabs.
+MANUAL_ENTRIES = [
+    {
+        'Manager': 'Marselis',
+        'Fund Name': 'Marselis Corporate Bonds',
+        'ISIN': 'DK0064869671',
+        'Assets (EUR M)': None,
+        'Benchmark (Tracker)': '',
+        'Benchmark (Fund)': 'No official Benchmark',
+        'YTM (%)': '6.3%',
+        'OAS (bps)': '',
+        'Eff. Duration (yrs)': '3.45',
+        'Avg Rating': 'BB',
+        'Num Issues': '43',
+        'Domicile': 'Denmark (AIF)',
+        'UCITS Status': 'AIF (UCITS version: DK0064869671)',
+        'As Of Date': '12/08/2026',
+        'Source': 'Email (Thomas Knudsen, 12 Aug 2026)',
+        'Currency': {'EUR': 1.0},
+    },
+]
+
+
+def normalise_label(label):
+    s = str(label).strip()
+    return LABEL_MAP.get(s, LABEL_MAP.get(s.lower(), s))
+
+
+def normalise_scale(data):
+    """If values look like 0-100 percentages, convert to 0-1 decimals."""
+    vals = [v for v in data.values() if v is not None]
+    try:
+        nums = [float(v) for v in vals]
+    except (ValueError, TypeError):
+        return data
+    if nums and max(nums) > 1.5:
+        return {k: (float(v) / 100 if v is not None else None) for k, v in data.items()}
+    return data
+
+
+def find_sharepoint_folder():
+    if SHAREPOINT_FOLDER:
+        p = Path(SHAREPOINT_FOLDER)
+        if p.exists():
+            return p
+        raise FileNotFoundError(f"Configured SHAREPOINT_FOLDER not found: {SHAREPOINT_FOLDER}")
+
+    username = os.getenv('USERNAME', '')
+    user_home = Path(f'C:/Users/{username}')
+
+    search_roots = [
+        user_home / 'Mediolanum International Funds',
+        user_home / 'OneDrive - Mediolanum International Funds',
+    ]
+
+    for root in search_roots:
+        candidate = root / SHAREPOINT_FOLDER_NAME
+        if candidate.exists():
+            return candidate
+
+    for root in search_roots:
+        if root.exists():
+            for d in root.iterdir():
+                if d.is_dir() and 'ghy' in d.name.lower() and 'manager' in d.name.lower():
+                    return d
+
+    raise FileNotFoundError(
+        f"Could not auto-detect the synced SharePoint folder.\n"
+        f"Searched under: {', '.join(str(r) for r in search_roots)}\n\n"
+        f"FIX: Set SHAREPOINT_FOLDER at the top of this script to your local synced path.\n"
+        f"     e.g. SHAREPOINT_FOLDER = r'C:\\Users\\{username}\\Mediolanum International Funds\\{SHAREPOINT_FOLDER_NAME}'"
+    )
+
+
+def find_logo():
+    for p in LOGO_PATH_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def read_tracker(base):
+    tracker_path = base / TRACKER_FILENAME
+    df = pd.read_excel(tracker_path, header=0)
+    df = df.dropna(subset=['Fund Name'])
+    valid_statuses = ['spreadsheet sent', 'spreadsheet does not contain fx']
+    sent = df[df['Excel Sent ?'].str.strip().str.lower().isin(valid_statuses)].copy()
+    sent['has_fx'] = sent['Excel Sent ?'].str.strip().str.lower() == 'spreadsheet sent'
+    return sent
+
+
+def find_excel_in_folder(folder_path):
+    excels = []
+    for root, _, files in os.walk(folder_path):
+        for f in files:
+            if not f.endswith('.xlsx'):
+                continue
+            if f.startswith('~$'):
+                continue
+            full_path = os.path.join(root, f)
+            rel_path = os.path.relpath(full_path, folder_path)
+            excels.append(rel_path)
+    return sorted(excels)
+
+
+def extract_headline_stats_standard(ws):
+    stats = {}
+    as_of_date = None
+    for row in ws.iter_rows(max_row=20, values_only=True):
+        cells = list(row)
+        for i, cell in enumerate(cells):
+            if cell and isinstance(cell, str):
+                stripped = cell.strip()
+                if stripped in HEADLINE_FIELDS and i + 1 < len(cells):
+                    stats[stripped] = cells[i + 1]
+                if stripped.lower() == 'isin' and i + 1 < len(cells):
+                    stats['ISIN'] = cells[i + 1]
+                if stripped == 'Strategy Info' and i + 1 < len(cells) and cells[i + 1]:
+                    stats['Strategy Description'] = cells[i + 1]
+                if 'data as of' in stripped.lower() or 'as of' in stripped.lower():
+                    as_of_date = stripped
+    if as_of_date:
+        stats['As Of Date'] = as_of_date
+    return stats
+
+
+def extract_headline_stats_crossingbridge(ws):
+    stats = {}
+    for row in ws.iter_rows(max_row=15, values_only=True):
+        cells = list(row)
+        if cells and cells[0] and isinstance(cells[0], str):
+            stripped = cells[0].strip()
+            if stripped in HEADLINE_FIELDS and len(cells) > 1:
+                stats[stripped] = cells[1]
+    return stats
+
+
+def _headline_payload_score(stats):
+    score = 0
+    for f in HEADLINE_FIELDS:
+        v = stats.get(f)
+        if v is not None and str(v).strip() != '':
+            score += 1
+    isin_v = stats.get('ISIN')
+    if isin_v is not None and str(isin_v).strip() != '':
+        score += 1
+    return score
+
+
+def extract_headline_stats_flexible(wb):
+    """Extract headline stats from the best candidate sheet in a workbook."""
+    ordered_candidates = []
+
+    # Prefer the dedicated strategy sheet where available (e.g., Goldman template).
+    for s in wb.sheetnames:
+        if s.strip().lower() == 'strategy info':
+            ordered_candidates.append(s)
+    for s in wb.sheetnames:
+        if s not in ordered_candidates:
+            ordered_candidates.append(s)
+
+    best_stats = {}
+    best_score = -1
+    for s in ordered_candidates:
+        stats = extract_headline_stats_standard(wb[s])
+        score = _headline_payload_score(stats)
+        if score > best_score:
+            best_stats = stats
+            best_score = score
+
+        # Good enough payload found; avoid unnecessary sheet scans.
+        if score >= 3:
+            break
+
+    return best_stats
+
+
+def extract_breakdown_section(ws, section_label, max_search_row=80):
+    rows = list(ws.iter_rows(values_only=True))
+    start_idx = None
+    start_col = None
+    for i, row in enumerate(rows[:max_search_row]):
+        if not row:
+            continue
+        for j, cell in enumerate(row[:8]):
+            if cell and isinstance(cell, str) and cell.strip().lower().startswith(section_label.lower()):
+                start_idx = i
+                start_col = j
+                break
+        if start_idx is not None:
+            break
+
+    if start_idx is None:
+        return {}
+
+    header_row = rows[start_idx]
+    value_cols = [j for j in range((start_col or 0) + 1, len(header_row)) if header_row[j] is not None]
+
+    if not value_cols:
+        return {}
+
+    last_col_idx = value_cols[-1]
+    result = {}
+    for row in rows[start_idx + 1:start_idx + 60]:
+        if row is None or (start_col is not None and (start_col >= len(row) or row[start_col] is None)):
+            break
+        label = normalise_label(row[start_col])
+        if label.lower() in ('total', '') or label.startswith('*'):
+            break
+        val = row[last_col_idx] if last_col_idx < len(row) else None
+        if val is None and last_col_idx > (start_col or 0) + 1:
+            for j in range(min(last_col_idx, len(row) - 1), (start_col or 0), -1):
+                if row[j] is not None:
+                    val = row[j]
+                    break
+        result[label] = val
+
+    return normalise_scale(result)
+
+
+def extract_breakdown_from_sheet(wb, sheet_name):
+    if sheet_name not in wb.sheetnames:
+        return {}, {}, {}
+    ws = wb[sheet_name]
+    currency = extract_breakdown_section(ws, 'Currency')
+    region = extract_breakdown_section(ws, 'Region')
+    country = extract_breakdown_section(ws, 'Country')
+    return currency, region, country
+
+
+def extract_breakdowns_flexible(wb):
+    """Extract Currency/Region/Country even when they are split across sheets."""
+    sheet_lowers = {s: s.lower() for s in wb.sheetnames}
+
+    currency_sheet = next((s for s, low in sheet_lowers.items() if 'currency' in low), None)
+    region_sheet = next((s for s, low in sheet_lowers.items() if 'region' in low and 'country' not in low), None)
+    country_sheet = next((s for s, low in sheet_lowers.items() if 'country' in low and 'region' not in low), None)
+    fx_sheet = next((s for s, low in sheet_lowers.items() if 'fx' in low), None)
+
+    currency = extract_breakdown_section(wb[currency_sheet], 'Currency') if currency_sheet else {}
+    region = extract_breakdown_section(wb[region_sheet], 'Region') if region_sheet else {}
+    country = extract_breakdown_section(wb[country_sheet], 'Country') if country_sheet else {}
+
+    # Fallback to a combined FX sheet if a dedicated section was not found.
+    if fx_sheet:
+        if not currency:
+            currency = extract_breakdown_section(wb[fx_sheet], 'Currency')
+        if not region:
+            region = extract_breakdown_section(wb[fx_sheet], 'Region')
+        if not country:
+            country = extract_breakdown_section(wb[fx_sheet], 'Country')
+
+    # Final fallback: scan all sheets for any missing sections, regardless of sheet name.
+    fallback_hits = []
+    if not currency or not region or not country:
+        for s in wb.sheetnames:
+            ws = wb[s]
+            if not currency:
+                c = extract_breakdown_section(ws, 'Currency')
+                if c:
+                    currency = c
+                    fallback_hits.append(s)
+            if not region:
+                r = extract_breakdown_section(ws, 'Region')
+                if r:
+                    region = r
+                    fallback_hits.append(s)
+            if not country:
+                cty = extract_breakdown_section(ws, 'Country')
+                if cty:
+                    country = cty
+                    fallback_hits.append(s)
+            if currency and region and country:
+                break
+
+    # Preserve order while avoiding duplicate sheet scans.
+    date_sheet_candidates = []
+    for s in (currency_sheet, region_sheet, country_sheet, fx_sheet):
+        if s and s not in date_sheet_candidates:
+            date_sheet_candidates.append(s)
+    for s in fallback_hits:
+        if s and s not in date_sheet_candidates:
+            date_sheet_candidates.append(s)
+
+    as_of = None
+    for s in date_sheet_candidates:
+        as_of = _get_last_date_from_sheet(wb[s])
+        if as_of:
+            break
+
+    return currency, region, country, as_of, date_sheet_candidates
+
+
+def _has_numeric_data(row):
+    return any(isinstance(c, (int, float)) for c in row[1:] if c is not None)
+
+
+def _extract_latest_row_as_dict(ws, header_row_idx=0):
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return {}
+    header = rows[header_row_idx]
+    labels = [normalise_label(c) for c in header[1:] if c is not None]
+    last_row = None
+    for r in rows[header_row_idx + 1:]:
+        if r[0] is not None and _has_numeric_data(r):
+            last_row = r
+    if last_row and labels:
+        d = {labels[i]: last_row[i + 1] for i in range(len(labels)) if i + 1 < len(last_row)}
+        return normalise_scale(d)
+    return {}
+
+
+def extract_crossingbridge_breakdowns(wb):
+    currency, region, country = {}, {}, {}
+    for sname in wb.sheetnames:
+        lower = sname.lower()
+        if 'currency' in lower:
+            currency = _extract_latest_row_as_dict(wb[sname])
+        elif 'region' in lower and 'country' not in lower:
+            region = _extract_latest_row_as_dict(wb[sname])
+        elif 'country' in lower and 'region' not in lower:
+            country = _extract_latest_row_as_dict(wb[sname])
+    return currency, region, country
+
+
+def _get_last_date_from_sheet(ws):
+    """Extract the last date column header from an FX/breakdown sheet."""
+    from datetime import datetime as dt
+    for row in ws.iter_rows(max_row=5, values_only=True):
+        dates = [c for c in row[1:] if c is not None and isinstance(c, (dt, datetime))]
+        if dates:
+            last = max(dates)
+            return last.strftime('%d/%m/%Y')
+        str_dates = [c for c in row[1:] if c is not None and isinstance(c, str) and any(ch.isdigit() for ch in c)]
+        if str_dates:
+            return str(str_dates[-1])
+    return None
+
+
+def _get_last_date_crossingbridge(wb):
+    """CrossingBridge has dates in col A, so grab the last non-None row."""
+    from datetime import datetime as dt
+    for sname in wb.sheetnames:
+        if 'currency' in sname.lower():
+            ws = wb[sname]
+            last_date = None
+            for row in ws.iter_rows(values_only=True):
+                if row[0] is not None and isinstance(row[0], (dt, datetime)):
+                    last_date = row[0]
+            if last_date:
+                return last_date.strftime('%d/%m/%Y')
+    return None
+
+
+WORD_ALIASES = {
+    'bw': 'brandywine',
+    'ftgf': 'franklin templeton',
+    'nt': 'northern trust',
+    'ssga': 'state street',
+    'loim': 'lombard odier',
+    'lof': 'lombard odier',
+}
+
+FOLDER_TO_FUND_ALIAS = {
+    'Northern Trust': ['NT', 'Northern Trust', 'NTAM'],
+    'BNY Mellon': ['BNY', 'BNY Mellon'],
+    'CrossingBridge': ['CrossingBridge', 'Crossing Bridge'],
+    'Franklin Templeton': ['Franklin', 'Templeton', 'Brandywine', 'FTGF'],
+    'Goldman Sachs Asset Management': ['GSAM', 'Goldman'],
+    'State Street': ['State Street', 'SSGA', 'Stt Strt', 'Stt. Strt'],
+    "Tell\u00b4s Arrow": ["Tell's Arrow", "Tell", "Tells Arrow"],
+    'Lombard Odier': ['Lombard Odier', 'Lombard', 'Odier', 'LOIM', 'LOF', 'LO Funds'],
+    'Lombard Odier Investment Managers': ['Lombard Odier', 'Lombard', 'Odier', 'LOIM', 'LOF', 'LO Funds'],
+}
+
+# Optional per-manager cap to avoid share-class duplication while still
+# allowing a fixed number of distinct strategies.
+MANAGER_STRATEGY_LIMITS = {
+    'barings': 3,
+}
+
+
+def get_manager_strategy_limit(folder_name):
+    low = str(folder_name).lower()
+    for key, limit in MANAGER_STRATEGY_LIMITS.items():
+        if key in low:
+            return limit
+    return None
+
+
+def expand_fund_words(fund_name):
+    words = set()
+    for w in fund_name.lower().split():
+        words.add(w)
+        if w in WORD_ALIASES:
+            for aw in WORD_ALIASES[w].split():
+                words.add(aw)
+    return {w for w in words if len(w) > 2}
+
+
+def folder_matches_fund(folder_name, fund_name):
+    if not fund_name:
+        return False
+    fn_lower = fund_name.lower()
+    fl_lower = folder_name.lower()
+
+    # Normalize punctuation so names like "Lombard-Odier" or "Tell's" still match.
+    fn_alnum = ''.join(ch if ch.isalnum() or ch.isspace() else ' ' for ch in fn_lower)
+    fl_alnum = ''.join(ch if ch.isalnum() or ch.isspace() else ' ' for ch in fl_lower)
+
+    if fl_lower in fn_lower:
+        return True
+    if fl_alnum in fn_alnum:
+        return True
+    for alias in FOLDER_TO_FUND_ALIAS.get(folder_name, []):
+        alias_lower = alias.lower()
+        alias_alnum = ''.join(ch if ch.isalnum() or ch.isspace() else ' ' for ch in alias_lower)
+        if alias_lower in fn_lower or alias_alnum in fn_alnum:
+            return True
+    fn_tokens = {t for t in fn_alnum.split() if len(t) > 2}
+    fl_tokens = {t for t in fl_alnum.split() if len(t) > 2}
+    if fn_tokens & fl_tokens:
+        return True
+    return False
+
+
+def pick_best_excel(fund_name, excels):
+    fn_words = expand_fund_words(fund_name) if fund_name else set()
+    noise = {'franklin', 'templeton', 'global', 'high', 'yield', 'ghy', 'manager', 'data'}
+    scored = []
+    for name in excels:
+        en_words = set(w for w in name.lower().replace('.xlsx', '').replace('-', ' ').replace('_', ' ').split() if len(w) > 2)
+        score = len(fn_words & en_words) * 2 - len(en_words - fn_words - noise)
+        scored.append((score, name))
+    scored.sort(key=lambda x: -x[0])
+    return scored[0][1] if scored[0][0] > 0 else None
+
+
+def extract_timeseries_from_sheet(wb, sheet_name):
+    if sheet_name not in wb.sheetnames:
+        return {}
+    ws = wb[sheet_name]
+    rows = list(ws.iter_rows(values_only=True))
+    result = {}
+
+    def _detect_section_start(section_label):
+        for i, row in enumerate(rows[:80]):
+            if not row:
+                continue
+            for j, cell in enumerate(row[:8]):
+                if cell and isinstance(cell, str) and cell.strip().lower().startswith(section_label.lower()):
+                    return i, j
+        return None, None
+
+    def _parse_date_col(cell):
+        if cell is None:
+            return None
+        if isinstance(cell, datetime):
+            return cell
+        if isinstance(cell, str) and any(ch.isdigit() for ch in cell):
+            try:
+                return pd.to_datetime(cell)
+            except Exception:
+                return None
+        return None
+
+    for section_label in ('Currency', 'Region', 'Country'):
+        start_idx, start_col = _detect_section_start(section_label)
+        if start_idx is None:
+            continue
+
+        header = rows[start_idx]
+        date_cols = []
+        for j in range((start_col or 0) + 1, len(header)):
+            d = _parse_date_col(header[j])
+            if d is not None:
+                date_cols.append((j, d))
+        if not date_cols:
+            continue
+
+        for row in rows[start_idx + 1:start_idx + 60]:
+            if row is None or (start_col is not None and (start_col >= len(row) or row[start_col] is None)):
+                break
+            label = normalise_label(row[start_col])
+            if label.lower() in ('total', '') or label.startswith('*'):
+                break
+
+            series = {}
+            for col_idx, d in date_cols:
+                val = row[col_idx] if col_idx < len(row) else None
+                if val is not None:
+                    try:
+                        series[d.strftime('%Y-%m-%d')] = float(val)
+                    except (ValueError, TypeError):
+                        pass
+            if series:
+                key = f"{section_label}|{label}"
+                result[key] = series
+    return result
+
+
+def process_single_file(excel_path, fund_name, benchmark, isin, assets,
+                        folder_name, has_fx, all_headline, all_currency, all_region, all_country, all_timeseries):
+    try:
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+    except Exception as e:
+        print(f"  ERROR reading {excel_path}: {e}")
+        return False
+
+    is_cb = 'crossingbridge' in folder_name.lower()
+
+    if is_cb:
+        stats = extract_headline_stats_crossingbridge(wb[wb.sheetnames[0]])
+    else:
+        stats = extract_headline_stats_flexible(wb)
+
+    def _norm_isin(v):
+        if v is None:
+            return ''
+        return str(v).upper().replace(' ', '').replace('-', '')
+
+    # Barings exception: only process output when sheet ISIN matches tracker ISIN.
+    if 'barings' in folder_name.lower():
+        tracker_isin_norm = _norm_isin(isin)
+        sheet_isin_norm = _norm_isin(stats.get('ISIN'))
+        if not sheet_isin_norm or sheet_isin_norm != tracker_isin_norm:
+            wb.close()
+            print(
+                f"  Skipped (ISIN mismatch): {folder_name} / {os.path.basename(excel_path)} "
+                f"[tracker={isin}, sheet={stats.get('ISIN', '')}]"
+            )
+            return False
+
+    output_isin = isin
+    if 'barings' in folder_name.lower() and stats.get('ISIN') not in (None, ''):
+        output_isin = stats.get('ISIN')
+
+    all_headline.append({
+        'Manager': folder_name,
+        'Fund Name': fund_name,
+        'ISIN': output_isin,
+        'Assets (EUR M)': assets,
+        'Benchmark (Tracker)': benchmark,
+        'Benchmark (Fund)': stats.get('Fund reference benchmark', ''),
+        'As Of Date': stats.get('As Of Date', stats.get('Strategy Description', '')),
+        'YTM (%)': stats.get('Yield To Maturity (%)', ''),
+        'OAS (bps)': stats.get('Option Adjusted Spread (bps)', ''),
+        'Eff. Duration (yrs)': stats.get('Effective Duration (yrs)', ''),
+        'Avg Rating': stats.get('Average Rating', ''),
+        'Num Issues': stats.get('Number of issues', ''),
+        'Domicile': stats.get('Fund Domicile/Legal structure', ''),
+        'UCITS Status': stats.get('Fund Legal Status (UCITS)', ''),
+    })
+
+    label = f"{folder_name} - {fund_name}"
+    if not has_fx:
+        cur, reg, cty = {}, {}, {}
+        as_of = None
+    elif is_cb:
+        cur, reg, cty = extract_crossingbridge_breakdowns(wb)
+        as_of = _get_last_date_crossingbridge(wb)
+    else:
+        cur, reg, cty, as_of, ts_sheets = extract_breakdowns_flexible(wb)
+        merged_ts = {}
+        for s in ts_sheets:
+            ts = extract_timeseries_from_sheet(wb, s)
+            if ts:
+                merged_ts.update(ts)
+        if merged_ts:
+            all_timeseries[label] = merged_ts
+
+    if as_of:
+        all_headline[-1]['As Of Date'] = as_of
+
+    # Business override: force BNY Mellon currency exposure to 100% USD.
+    if 'bny mellon' in folder_name.lower():
+        cur = {'USD': 1.0}
+
+    if cur:
+        all_currency[label] = cur
+    if reg:
+        all_region[label] = reg
+    if cty:
+        all_country[label] = cty
+
+    wb.close()
+    print(f"  Processed: {folder_name} / {os.path.basename(excel_path)}")
+    return True
+
+
+def process_all_managers(base):
+    tracker = read_tracker(base)
+    all_headline, all_currency, all_region, all_country, all_timeseries = [], {}, {}, {}, {}
+    processed_manager_excels = {}
+
+    folder_candidates = []
+    for d in os.listdir(base):
+        dp = os.path.join(base, d)
+        if os.path.isdir(dp):
+            excels = find_excel_in_folder(dp)
+            if excels:
+                folder_candidates.append((d, dp, excels))
+
+    for _, row in tracker.iterrows():
+        fund_name = row['Fund Name']
+        benchmark = row.get('Benchmark', '')
+        isin = row.get('ISIN', '')
+        assets = row.get('Assets (EUR M)', '')
+        has_fx = row.get('has_fx', True)
+
+        for folder_name, folder_path, excels in folder_candidates:
+            if not folder_matches_fund(folder_name, fund_name):
+                continue
+
+            manager_key = folder_name.lower()
+            strategy_limit = get_manager_strategy_limit(folder_name)
+            seen_excels = processed_manager_excels.setdefault(manager_key, set())
+            if strategy_limit is not None and len(seen_excels) >= strategy_limit:
+                continue
+
+            if len(excels) == 1:
+                target = excels[0]
+            else:
+                target = pick_best_excel(fund_name, excels)
+                if strategy_limit is not None and not target:
+                    remaining = [e for e in sorted(excels) if e not in seen_excels]
+                    target = remaining[0] if remaining else sorted(excels)[0]
+
+            if strategy_limit is not None and target in seen_excels:
+                target = None
+                remaining = [e for e in sorted(excels) if e not in seen_excels]
+                if remaining:
+                    target = remaining[0]
+
+            # Generic behavior: when multiple files exist for a manager, avoid
+            # reusing the same workbook until all candidates have been used once.
+            if target and target in seen_excels and len(seen_excels) < len(excels):
+                remaining = [e for e in sorted(excels) if e not in seen_excels]
+                if remaining:
+                    rem_best = pick_best_excel(fund_name, remaining)
+                    target = rem_best or remaining[0]
+
+            if target:
+                processed_ok = process_single_file(
+                    os.path.join(folder_path, target), fund_name, benchmark, isin, assets,
+                    folder_name, has_fx, all_headline, all_currency, all_region, all_country, all_timeseries
+                )
+                if processed_ok:
+                    seen_excels.add(target)
+                if strategy_limit is not None and not processed_ok:
+                    remaining = [e for e in sorted(excels) if e not in seen_excels and e != target]
+                    for chosen in remaining:
+                        processed_ok = process_single_file(
+                            os.path.join(folder_path, chosen), fund_name, benchmark, isin, assets,
+                            folder_name, has_fx, all_headline, all_currency, all_region, all_country, all_timeseries
+                        )
+                        if processed_ok:
+                            seen_excels.add(chosen)
+                            break
+            else:
+                if strategy_limit is not None:
+                    remaining = [e for e in sorted(excels) if e not in seen_excels]
+                    for chosen in remaining:
+                        processed_ok = process_single_file(
+                            os.path.join(folder_path, chosen), fund_name, benchmark, isin, assets,
+                            folder_name, has_fx, all_headline, all_currency, all_region, all_country, all_timeseries
+                        )
+                        if processed_ok:
+                            seen_excels.add(chosen)
+                            break
+                else:
+                    for name in excels:
+                        process_single_file(
+                            os.path.join(folder_path, name), fund_name, benchmark, isin, assets,
+                            folder_name, has_fx, all_headline, all_currency, all_region, all_country, all_timeseries
+                        )
+            break
+
+    headline_df = pd.DataFrame(all_headline)
+
+    if MANUAL_ENTRIES:
+        manual_df = pd.DataFrame(MANUAL_ENTRIES).dropna(axis=1, how='all')
+        manual_df = manual_df.drop(columns=['Currency', 'Region', 'Country'], errors='ignore')
+        headline_df = pd.concat([headline_df, manual_df], ignore_index=True)
+        for entry in MANUAL_ENTRIES:
+            label = f"{entry['Manager']} - {entry['Fund Name']}"
+            if entry.get('Currency'):
+                all_currency[label] = entry['Currency']
+            if entry.get('Region'):
+                all_region[label] = entry['Region']
+            if entry.get('Country'):
+                all_country[label] = entry['Country']
+
+    def collect_keys(d):
+        keys = set()
+        for v in d.values():
+            keys |= set(v.keys())
+        return sorted(keys)
+
+    return (
+        headline_df,
+        build_breakdown_df(all_currency, collect_keys(all_currency)),
+        build_breakdown_df(all_region, collect_keys(all_region)),
+        build_breakdown_df(all_country, collect_keys(all_country)),
+        all_timeseries,
+    )
+
+
+def build_breakdown_df(data_dict, all_keys):
+    if not all_keys:
+        return pd.DataFrame()
+
+    rows = [{'Strategy': label, **{k: vals.get(k) for k in all_keys}} for label, vals in data_dict.items()]
+    df = pd.DataFrame(rows)
+
+    numeric_cols = [c for c in df.columns if c != 'Strategy']
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    agg = {'Strategy': 'Average (Peer Group)'}
+    count = {'Strategy': 'Count (non-zero)'}
+    for col in numeric_cols:
+        valid = df[col].dropna()
+        agg[col] = valid.mean() if len(valid) > 0 else None
+        count[col] = int((valid > 0).sum())
+    df = pd.concat([df, pd.DataFrame([agg, count])], ignore_index=True)
+    return df
+
+
+def normalise_series_to_percent(series_dict):
+    """Normalise one time-series to percentage scale using a single series-level rule."""
+    parsed = []
+    for date_str, raw_val in (series_dict or {}).items():
+        try:
+            v = float(raw_val)
+        except (TypeError, ValueError):
+            continue
+        parsed.append((str(date_str), v))
+
+    if not parsed:
+        return {}
+
+    # Decide scale once per series to avoid mixed-unit flips (e.g. 3.59 then 0.99).
+    max_abs = max(abs(v) for _, v in parsed)
+    uses_decimal_scale = max_abs <= 1.5
+
+    out = {}
+    for d, v in parsed:
+        pct = v * 100 if uses_decimal_scale else v
+        pct = max(0.0, min(100.0, pct))
+        out[d] = round(pct, 4)
+    return out
+
+
+def normalise_timeseries_percent(timeseries):
+    """Normalise all manager time-series to percentage scale for plotting/aggregation."""
+    normalised = {}
+    for manager, mgr_data in (timeseries or {}).items():
+        if not isinstance(mgr_data, dict):
+            continue
+        mgr_out = {}
+        for key, vals in mgr_data.items():
+            if not isinstance(key, str) or not isinstance(vals, dict):
+                continue
+            norm_vals = normalise_series_to_percent(vals)
+            if norm_vals:
+                mgr_out[key] = norm_vals
+        if mgr_out:
+            normalised[manager] = mgr_out
+    return normalised
+
+
+def save_to_excel(headline_df, currency_df, region_df, country_df, output_dir):
+    output_path = output_dir / OUTPUT_EXCEL
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        headline_df.to_excel(writer, sheet_name='Headline Stats', index=False)
+        if not currency_df.empty:
+            currency_df.to_excel(writer, sheet_name='Currency Breakdown', index=False)
+        if not region_df.empty:
+            region_df.to_excel(writer, sheet_name='Region Breakdown', index=False)
+        if not country_df.empty:
+            country_df.to_excel(writer, sheet_name='Country Breakdown', index=False)
+    print(f"\nExcel saved: {output_path}")
+
+
+def fmt_pct(val):
+    if val is None or pd.isna(val):
+        return '—'
+    try:
+        v = float(val)
+        return f'{v * 100:.1f}%' if v <= 1 else f'{v:.1f}%'
+    except (ValueError, TypeError):
+        return html.escape(str(val))
+
+
+def fmt_val(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return '—'
+    s = str(val).strip()
+    import re
+    s = re.sub(r'(\d),(\d{1,2})(?!\d)', r'\1.\2', s)
+    return html.escape(s)
+
+
+def fmt_assets(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return '—'
+    try:
+        return f'{float(val):,.1f}'
+    except (ValueError, TypeError):
+        return html.escape(str(val))
+
+
+def _tooltip_wrap(short_text, full_text, css_class=''):
+    tip = html.escape(full_text).replace('\n', '&#10;')
+    cls = f'has-tip {css_class}'.strip()
+    return f'<span class="{cls}">{short_text}<span class="tip-box">{html.escape(full_text)}</span></span>'
+
+
+def fmt_benchmark(raw_bmk):
+    if raw_bmk is None or (isinstance(raw_bmk, float) and pd.isna(raw_bmk)):
+        return '<span class="bmk-tag bmk-none">No benchmark</span>'
+    s = str(raw_bmk).strip()
+    low = s.lower()
+    if not s or s == 'nan':
+        return '<span class="bmk-tag bmk-none">No benchmark</span>'
+    no_bmk_keywords = ['no benchmark', 'no formal benchmark', 'do not follow any benchmark', 'cash benchmark']
+    if any(k in low for k in no_bmk_keywords):
+        return _tooltip_wrap('<span class="bmk-tag bmk-none">No benchmark</span>', s)
+    custom_keywords = ['custom', '50%', '30%', '35%', '70%', 'blended']
+    if any(k in low for k in custom_keywords):
+        return _tooltip_wrap('<span class="bmk-tag bmk-custom">Custom benchmark</span>', s)
+    return html.escape(s)
+
+
+def _extract_short(val, col):
+    import re
+    s = str(val).strip()
+    if len(s) <= 50:
+        return None
+    low = s.lower()
+    if col == 'YTM (%)':
+        m = re.search(r'(\d+\.\d+%)', s)
+        return m.group(1) if m else s[:40]
+    if col == 'OAS (bps)':
+        m = re.search(r'(\d+[\.,]?\d*)\s*(?:bps|bp)', s, re.I)
+        if m:
+            return m.group(1) + ' bps'
+        if 'not' in low or 'don' in low or 'n/a' in low:
+            return 'N/A'
+        return s[:40]
+    if col == 'Eff. Duration (yrs)':
+        matches = re.findall(r'(\d+\.\d+)\s*(?:yr|year)', s, re.I)
+        if matches:
+            return ' / '.join(matches) + ' yrs'
+        return s[:40]
+    if col == 'Avg Rating':
+        if 'breakdown' in low or 'cash:' in low or 'aaa:' in low or 'bbb:' in low:
+            return 'See details'
+        m = re.search(r'\b(A{1,3}|B{1,3}|C{1,3})([+-])?\b', s)
+        if m:
+            return m.group(0)
+        if 'not rated' in low or 'n/a' in low:
+            return 'NR'
+        return s[:40]
+    if col == 'Num Issues':
+        cleaned = re.sub(r'\b\d{4}\b', '', s)
+        m = re.search(r'(\d{2,})', cleaned)
+        return m.group(1) if m else s[:30]
+    if col == 'Domicile':
+        m = re.match(r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)', s)
+        return m.group(1) if m else s.split('.')[0][:30]
+    if col == 'UCITS Status':
+        if 'ucits' in low:
+            return 'UCITS'
+        if 'non-ucits' in low or 'not ucits' in low:
+            return 'Non-UCITS'
+        return s[:30]
+    return s[:40]
+
+
+def smart_cell(val, col, is_num=False):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return '—'
+    import re
+    s = str(val).strip()
+    s = re.sub(r'(\d),(\d{1,2})(?!\d)', r'\1.\2', s)
+    if col == 'YTM (%)':
+        try:
+            v = float(s)
+            if 0 < v < 1:
+                return f'{v * 100:.1f}%'
+        except (ValueError, TypeError):
+            pass
+    if col == 'Eff. Duration (yrs)':
+        try:
+            v = float(s)
+            return f'{v:.1f}'
+        except (ValueError, TypeError):
+            pass
+    if col == 'OAS (bps)':
+        try:
+            v = float(s)
+            return f'{v:.1f}'
+        except (ValueError, TypeError):
+            pass
+    short = _extract_short(val, col)
+    if short is None:
+        return html.escape(s)
+    short = re.sub(r'(\d),(\d{1,2})(?!\d)', r'\1.\2', short)
+    return _tooltip_wrap(html.escape(short), s)
+
+
+def generate_html(headline_df, currency_df, region_df, country_df, output_dir, timeseries=None):
+    logo_path = find_logo()
+    logo_b64 = base64.b64encode(logo_path.read_bytes()).decode() if logo_path else ''
+
+    now = datetime.now().strftime('%d %b %Y, %H:%M')
+    today = datetime.now().strftime('%d %B %Y')
+    n_managers = len(headline_df)
+    normalised_timeseries = normalise_timeseries_percent(timeseries)
+
+    headline_rows = ''
+    for _, row in headline_df.iterrows():
+        headline_rows += f'''<tr class="headline-detail">
+            <td><strong>{fmt_val(row.get('Manager', ''))}</strong></td>
+            <td>{fmt_val(row.get('Fund Name', ''))}</td>
+            <td>{fmt_val(row.get('ISIN', ''))}</td>
+            <td class="num">{fmt_assets(row.get('Assets (EUR M)', ''))}</td>
+            <td>{fmt_benchmark(row.get('Benchmark (Fund)', ''))}</td>
+            <td class="num">{smart_cell(row.get('YTM (%)', ''), 'YTM (%)')}</td>
+            <td class="num">{smart_cell(row.get('OAS (bps)', ''), 'OAS (bps)')}</td>
+            <td class="num">{smart_cell(row.get('Eff. Duration (yrs)', ''), 'Eff. Duration (yrs)')}</td>
+            <td>{smart_cell(row.get('Avg Rating', ''), 'Avg Rating')}</td>
+            <td class="num">{smart_cell(row.get('Num Issues', ''), 'Num Issues')}</td>
+            <td>{smart_cell(row.get('Domicile', ''), 'Domicile')}</td>
+            <td>{smart_cell(row.get('UCITS Status', ''), 'UCITS Status')}</td>
+            <td>{fmt_val(row.get('As Of Date', ''))}</td>
+        </tr>\n'''
+
+    def build_breakdown_table(df, fmt_func=fmt_pct, sort_cols_by_exposure=False, table_id=None, return_meta=False):
+        if df.empty:
+            if return_meta:
+                return '<p style="color:var(--text-muted)">No data available</p>', {
+                    'columns': [],
+                    'strategies': [],
+                    'latest': {},
+                }
+            return '<p style="color:var(--text-muted)">No data available</p>'
+        table_df = df.copy()
+        value_cols = [c for c in table_df.columns if c != 'Strategy']
+
+        cash_cols = [
+            c for c in value_cols
+            if normalise_label(str(c).strip()) == 'Cash' or 'cash' in str(c).lower()
+        ]
+
+        if cash_cols:
+            for c in cash_cols:
+                table_df[c] = pd.to_numeric(table_df[c], errors='coerce')
+            table_df['Cash'] = table_df[cash_cols].sum(axis=1, min_count=1)
+            keep_cols = [c for c in value_cols if c not in cash_cols]
+            cols = keep_cols + ['Cash']
+            table_df = table_df[['Strategy'] + cols]
+        else:
+            cols = value_cols
+
+        strategies = table_df['Strategy'].astype(str)
+        strat_lower = strategies.str.lower()
+        is_avg = strat_lower.str.contains('average', na=False)
+        is_count = strat_lower.str.contains('count', na=False)
+        is_summary = is_avg | is_count
+
+        detail_df = table_df[~is_summary].copy()
+        avg_df = table_df[is_avg].copy()
+        count_df = table_df[is_count].copy()
+
+        if sort_cols_by_exposure and cols:
+            col_rank = []
+            for c in cols:
+                valid = pd.to_numeric(detail_df[c], errors='coerce').dropna()
+                score = float(valid.mean()) if len(valid) > 0 else float('-inf')
+                col_rank.append((score, c))
+            col_rank.sort(key=lambda x: x[0], reverse=True)
+            cols = [c for _, c in col_rank]
+
+        header = '<th>Strategy</th>' + ''.join(f'<th>{html.escape(str(c))}</th>' for c in cols)
+        rows_html = ''
+
+        median_row = {'Strategy': 'Median (Peer Group)'}
+        for c in cols:
+            valid = pd.to_numeric(detail_df[c], errors='coerce').dropna()
+            median_row[c] = valid.median() if len(valid) > 0 else None
+
+        def render_row(strategy_label, row_data, is_count_row=False, is_agg_row=False):
+            cls = ' class="agg-row"' if is_agg_row else ' class="detail-row"'
+            cells = f'<td><strong>{html.escape(str(strategy_label))}</strong></td>'
+            for c in cols:
+                if is_count_row:
+                    v = row_data.get(c) if hasattr(row_data, 'get') else row_data[c]
+                    cells += f'<td class="num">{int(v) if v is not None and not pd.isna(v) else "—"}</td>'
+                else:
+                    v = row_data.get(c) if hasattr(row_data, 'get') else row_data[c]
+                    cells += f'<td class="num">{fmt_func(v)}</td>'
+            return f'<tr{cls}>{cells}</tr>\n'
+
+        for _, row in detail_df.iterrows():
+            rows_html += render_row(row['Strategy'], row, is_count_row=False, is_agg_row=False)
+
+        for _, row in avg_df.iterrows():
+            rows_html += render_row(row['Strategy'], row, is_count_row=False, is_agg_row=True)
+
+        rows_html += render_row(median_row['Strategy'], median_row, is_count_row=False, is_agg_row=True)
+
+        for _, row in count_df.iterrows():
+            rows_html += render_row(row['Strategy'], row, is_count_row=True, is_agg_row=True)
+
+        table_id_attr = f' id="{html.escape(table_id)}"' if table_id else ''
+        table_html = f'<table{table_id_attr} class="data-table"><thead><tr>{header}</tr></thead><tbody>{rows_html}</tbody></table>'
+
+        if not return_meta:
+            return table_html
+
+        def to_pct_num(v):
+            if v is None or pd.isna(v):
+                return None
+            fv = float(v)
+            if fv <= 1:
+                fv *= 100
+            return round(max(0.0, min(100.0, fv)), 4)
+
+        strategies = [str(s) for s in detail_df['Strategy'].tolist()]
+        latest = {}
+        for _, row in detail_df.iterrows():
+            strategy = str(row['Strategy'])
+            latest[strategy] = {}
+            for c in cols:
+                latest[strategy][str(c)] = to_pct_num(row[c])
+
+        return table_html, {
+            'columns': [str(c) for c in cols],
+            'strategies': strategies,
+            'latest': latest,
+        }
+
+    currency_table, currency_table_meta = build_breakdown_table(
+        currency_df,
+        table_id='currency-breakdown-table',
+        return_meta=True,
+    )
+    region_table = build_breakdown_table(region_df)
+    country_table = build_breakdown_table(country_df, sort_cols_by_exposure=True)
+
+    import json as _json
+
+    currency_monthly_data = {}
+    if normalised_timeseries:
+        for strategy, mgr_data in normalised_timeseries.items():
+            if not isinstance(mgr_data, dict):
+                continue
+            for key, vals in mgr_data.items():
+                if not isinstance(key, str) or not isinstance(vals, dict):
+                    continue
+                section, sep, label = key.partition('|')
+                if sep != '|' or section != 'Currency' or not label:
+                    continue
+
+                ccy = normalise_label(label)
+                ccy_key = 'Cash' if 'cash' in str(ccy).lower() else str(ccy)
+
+                for date_str, raw_val in vals.items():
+                    dt = pd.to_datetime(date_str, errors='coerce')
+                    if pd.isna(dt):
+                        continue
+                    try:
+                        v = float(raw_val)
+                    except (TypeError, ValueError):
+                        continue
+
+                    month_key = dt.strftime('%Y-%m')
+                    month_bucket = currency_monthly_data.setdefault(month_key, {})
+                    strat_bucket = month_bucket.setdefault(str(strategy), {})
+                    strat_bucket[ccy_key] = strat_bucket.get(ccy_key, 0.0) + v
+
+    currency_month_options = sorted(currency_monthly_data.keys())
+    currency_table_meta_json = _json.dumps(currency_table_meta)
+    currency_monthly_data_json = _json.dumps(currency_monthly_data)
+
+    currency_month_filter_section = ''
+    if currency_table_meta.get('columns'):
+        month_opts = ''.join(
+            f'<option value="{html.escape(m)}">{html.escape(m)}</option>'
+            for m in currency_month_options
+        )
+        currency_month_filter_section = f'''
+        <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border-subtle);background:rgba(25,45,110,0.02)">
+            <label for="currency-month-select" style="font-size:11px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--accent)">Month</label>
+            <select id="currency-month-select" onchange="renderCurrencyMonthTable()" style="padding:6px 10px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:12px;color:var(--text);background:var(--bg-card)">
+                <option value="latest" selected>Latest (As Of)</option>
+                {month_opts}
+            </select>
+        </div>
+        <script>
+        const CURRENCY_TABLE_META = {currency_table_meta_json};
+        const CURRENCY_MONTHLY_DATA = {currency_monthly_data_json};
+
+        function fmtPctCell(v) {{
+            if (v === null || v === undefined || Number.isNaN(Number(v))) return '—';
+            return Number(v).toFixed(1) + '%';
+        }}
+
+        function renderCurrencyMonthTable() {{
+            const table = document.getElementById('currency-breakdown-table');
+            const select = document.getElementById('currency-month-select');
+            if (!table || !select || !CURRENCY_TABLE_META) return;
+            const tbody = table.querySelector('tbody');
+            if (!tbody) return;
+
+            const cols = CURRENCY_TABLE_META.columns || [];
+            const strategies = CURRENCY_TABLE_META.strategies || [];
+            const latest = CURRENCY_TABLE_META.latest || {{}};
+            const selected = select.value;
+            const selectedData = selected === 'latest' ? latest : (CURRENCY_MONTHLY_DATA[selected] || {{}});
+
+            const detailRows = [];
+            const colValues = {{}};
+            cols.forEach(c => {{ colValues[c] = []; }});
+
+            strategies.forEach((strategy) => {{
+                const rowMap = selectedData[strategy] || {{}};
+                let cells = '<td><strong>' + strategy + '</strong></td>';
+                cols.forEach((c) => {{
+                    const raw = rowMap[c];
+                    const num = (raw === null || raw === undefined || Number.isNaN(Number(raw))) ? null : Number(raw);
+                    if (num !== null) colValues[c].push(num);
+                    cells += '<td class="num">' + fmtPctCell(num) + '</td>';
+                }});
+                detailRows.push('<tr class="detail-row">' + cells + '</tr>');
+            }});
+
+            function mean(arr) {{
+                if (!arr.length) return null;
+                return arr.reduce((a, b) => a + b, 0) / arr.length;
+            }}
+
+            function median(arr) {{
+                if (!arr.length) return null;
+                const s = [...arr].sort((a, b) => a - b);
+                const mid = Math.floor(s.length / 2);
+                return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+            }}
+
+            function countNonZero(arr) {{
+                return arr.filter(v => v > 0).length;
+            }}
+
+            let avgCells = '<td><strong>Average (Peer Group)</strong></td>';
+            let medCells = '<td><strong>Median (Peer Group)</strong></td>';
+            let cntCells = '<td><strong>Count (non-zero)</strong></td>';
+
+            cols.forEach((c) => {{
+                const arr = colValues[c] || [];
+                avgCells += '<td class="num">' + fmtPctCell(mean(arr)) + '</td>';
+                medCells += '<td class="num">' + fmtPctCell(median(arr)) + '</td>';
+                cntCells += '<td class="num">' + String(countNonZero(arr)) + '</td>';
+            }});
+
+            const summaryRows = [
+                '<tr class="agg-row">' + avgCells + '</tr>',
+                '<tr class="agg-row">' + medCells + '</tr>',
+                '<tr class="agg-row">' + cntCells + '</tr>'
+            ];
+
+            tbody.innerHTML = detailRows.join('') + summaryRows.join('');
+        }}
+
+        window.addEventListener('load', renderCurrencyMonthTable);
+        </script>'''
+
+    currency_deep_dive_data = {'EUR': [], 'GBP': [], 'USD': []}
+    if not currency_df.empty and 'Strategy' in currency_df.columns:
+        strategy_lower = currency_df['Strategy'].astype(str).str.lower()
+        detail_df = currency_df[
+            ~(strategy_lower.str.contains('average', na=False) | strategy_lower.str.contains('count', na=False))
+        ].copy()
+        for ccy in ('EUR', 'GBP', 'USD'):
+            if ccy not in detail_df.columns:
+                continue
+            vals = pd.to_numeric(detail_df[ccy], errors='coerce').dropna()
+            cleaned = []
+            for v in vals:
+                fv = float(v)
+                if fv <= 1:
+                    fv *= 100
+                if fv < 0:
+                    continue
+                if fv > 100:
+                    fv = 100
+                cleaned.append(round(fv, 4))
+            currency_deep_dive_data[ccy] = cleaned
+
+    deep_dive_json = _json.dumps(currency_deep_dive_data)
+    currency_deep_dive_section = f'''
+    <div class="section-heading"><div class="bar"></div><h2>Currency Deep Dive</h2></div>
+    <div class="card" style="padding:18px 20px 20px">
+        <div class="deep-dive-grid">
+            <div class="hist-panel">
+                <div class="hist-title">EUR Distribution</div>
+                <canvas id="hist-eur" height="220" style="width:100%"></canvas>
+                <div id="hist-eur-empty" class="hist-empty">No EUR exposure data</div>
+            </div>
+            <div class="hist-panel">
+                <div class="hist-title">GBP Distribution</div>
+                <canvas id="hist-gbp" height="220" style="width:100%"></canvas>
+                <div id="hist-gbp-empty" class="hist-empty">No GBP exposure data</div>
+            </div>
+            <div class="hist-panel">
+                <div class="hist-title">USD Distribution</div>
+                <canvas id="hist-usd" height="220" style="width:100%"></canvas>
+                <div id="hist-usd-empty" class="hist-empty">No USD exposure data</div>
+            </div>
+        </div>
+    </div>
+    <script>
+    const CURRENCY_DEEP_DIVE = {deep_dive_json};
+
+    function bucketCounts(values) {{
+        const bins = new Array(10).fill(0);
+        values.forEach((v) => {{
+            const clamped = Math.max(0, Math.min(100, Number(v)));
+            const idx = Math.min(9, Math.floor(clamped / 10));
+            bins[idx] += 1;
+        }});
+        return bins;
+    }}
+
+    function drawHistogram(canvasId, emptyId, values, color) {{
+        const canvas = document.getElementById(canvasId);
+        const emptyState = document.getElementById(emptyId);
+        if (!canvas || !emptyState) return;
+
+        if (!values || !values.length) {{
+            canvas.style.display = 'none';
+            emptyState.style.display = 'block';
+            return;
+        }}
+
+        canvas.style.display = 'block';
+        emptyState.style.display = 'none';
+
+        const bins = bucketCounts(values);
+        const labels = ['0-10', '10-20', '20-30', '30-40', '40-50', '50-60', '60-70', '70-80', '80-90', '90-100'];
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = canvas.offsetWidth * dpr;
+        canvas.height = 220 * dpr;
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.scale(dpr, dpr);
+
+        const W = canvas.offsetWidth;
+        const H = 220;
+        const pad = {{ l: 36, r: 12, t: 14, b: 40 }};
+        const chartW = W - pad.l - pad.r;
+        const chartH = H - pad.t - pad.b;
+        const maxCount = Math.max(1, ...bins);
+
+        ctx.clearRect(0, 0, W, H);
+        ctx.strokeStyle = '#DDD8D1';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pad.l, pad.t);
+        ctx.lineTo(pad.l, H - pad.b);
+        ctx.lineTo(W - pad.r, H - pad.b);
+        ctx.stroke();
+
+        ctx.fillStyle = '#5A6B85';
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textAlign = 'right';
+        for (let i = 0; i <= maxCount; i++) {{
+            const y = H - pad.b - (i / maxCount) * chartH;
+            ctx.strokeStyle = 'rgba(221, 216, 209, 0.7)';
+            ctx.beginPath();
+            ctx.moveTo(pad.l, y);
+            ctx.lineTo(W - pad.r, y);
+            ctx.stroke();
+            ctx.fillText(String(i), pad.l - 6, y + 3);
+        }}
+
+        const barGap = 4;
+        const barW = (chartW - barGap * (bins.length - 1)) / bins.length;
+        ctx.textAlign = 'center';
+        bins.forEach((count, i) => {{
+            const x = pad.l + i * (barW + barGap);
+            const h = (count / maxCount) * chartH;
+            const y = H - pad.b - h;
+
+            ctx.fillStyle = color;
+            ctx.fillRect(x, y, barW, h);
+
+            ctx.fillStyle = '#0E1C47';
+            ctx.font = '10px Inter, sans-serif';
+            if (count > 0) ctx.fillText(String(count), x + barW / 2, y - 4);
+
+            if (i % 2 === 0) {{
+                ctx.fillStyle = '#5A6B85';
+                ctx.font = '9px Inter, sans-serif';
+                ctx.fillText(labels[i], x + barW / 2, H - pad.b + 14);
+            }}
+        }});
+    }}
+
+    function renderCurrencyDeepDive() {{
+        drawHistogram('hist-eur', 'hist-eur-empty', CURRENCY_DEEP_DIVE.EUR || [], '#1E96D7');
+        drawHistogram('hist-gbp', 'hist-gbp-empty', CURRENCY_DEEP_DIVE.GBP || [], '#192D6E');
+        drawHistogram('hist-usd', 'hist-usd-empty', CURRENCY_DEEP_DIVE.USD || [], '#85D0CD');
+    }}
+
+    window.addEventListener('load', renderCurrencyDeepDive);
+    window.addEventListener('resize', renderCurrencyDeepDive);
+    </script>'''
+
+    currency_avg_ts_section = ''
+    if normalised_timeseries:
+        currency_series_points = {}
+        for mgr_data in normalised_timeseries.values():
+            if not isinstance(mgr_data, dict):
+                continue
+            for key, vals in mgr_data.items():
+                if not isinstance(key, str) or not isinstance(vals, dict):
+                    continue
+                section, sep, label = key.partition('|')
+                if sep != '|' or section != 'Currency' or not label:
+                    continue
+
+                ccy = normalise_label(label)
+                for date_str, raw_val in vals.items():
+                    try:
+                        v = float(raw_val)
+                    except (TypeError, ValueError):
+                        continue
+                    currency_series_points.setdefault(ccy, {}).setdefault(str(date_str), []).append(v)
+
+        currency_avg_ts = {}
+        for ccy, date_map in currency_series_points.items():
+            avg_map = {}
+            for d, arr in date_map.items():
+                if arr:
+                    avg_map[d] = round(sum(arr) / len(arr), 4)
+            if avg_map:
+                currency_avg_ts[ccy] = avg_map
+
+        preferred_ccy_order = ['EUR', 'GBP', 'USD']
+        ordered_ccys = [c for c in preferred_ccy_order if c in currency_avg_ts]
+        ordered_ccys += sorted([c for c in currency_avg_ts.keys() if c not in ordered_ccys])
+        ordered_currency_avg_ts = {c: currency_avg_ts[c] for c in ordered_ccys}
+
+        currency_avg_ts_json = _json.dumps(ordered_currency_avg_ts)
+        currency_avg_ts_section = f'''
+    <div class="section-heading"><div class="bar"></div><h2>Currency Average Through Time</h2></div>
+    <div class="card" style="padding:20px">
+        <canvas id="currency-avg-ts-canvas" height="340" style="width:100%"></canvas>
+        <div id="currency-avg-ts-empty" class="hist-empty">No currency time-series data available</div>
+        <div id="currency-avg-ts-legend" style="display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:12px;font-size:11px;color:var(--text-muted)"></div>
+    </div>
+    <script>
+    const CURRENCY_AVG_TS = {currency_avg_ts_json};
+    const CURRENCY_AVG_TS_COLORS = ['#192D6E','#1E96D7','#85D0CD','#DC5F87','#FEC35A','#436AB3','#47B8B4','#8B5CF6','#F97316','#059669','#E11D48','#6366F1'];
+
+    function drawCurrencyAverageTimeSeries() {{
+        const canvas = document.getElementById('currency-avg-ts-canvas');
+        const emptyEl = document.getElementById('currency-avg-ts-empty');
+        const legendEl = document.getElementById('currency-avg-ts-legend');
+        if (!canvas || !emptyEl || !legendEl) return;
+
+        const labels = Object.keys(CURRENCY_AVG_TS || {{}});
+        if (!labels.length) {{
+            canvas.style.display = 'none';
+            emptyEl.style.display = 'block';
+            legendEl.innerHTML = '';
+            return;
+        }}
+
+        const allDates = [...new Set(labels.flatMap((l) => Object.keys(CURRENCY_AVG_TS[l] || {{}})))].sort();
+        if (!allDates.length) {{
+            canvas.style.display = 'none';
+            emptyEl.style.display = 'block';
+            legendEl.innerHTML = '';
+            return;
+        }}
+
+        canvas.style.display = 'block';
+        emptyEl.style.display = 'none';
+
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = canvas.offsetWidth * dpr;
+        canvas.height = 340 * dpr;
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.scale(dpr, dpr);
+
+        const W = canvas.offsetWidth;
+        const H = 340;
+        const pad = {{ l: 60, r: 20, t: 20, b: 52 }};
+        const xStep = (W - pad.l - pad.r) / Math.max(allDates.length - 1, 1);
+
+        let maxVal = 0;
+        labels.forEach((l) => {{
+            Object.values(CURRENCY_AVG_TS[l] || {{}}).forEach((v) => {{
+                const n = Number(v);
+                if (!Number.isNaN(n) && n > maxVal) maxVal = n;
+            }});
+        }});
+        maxVal = Math.ceil((maxVal || 100) / 10) * 10;
+        const yScale = (H - pad.t - pad.b) / maxVal;
+
+        ctx.clearRect(0, 0, W, H);
+        ctx.strokeStyle = '#DDD8D1';
+        ctx.lineWidth = 0.8;
+        ctx.fillStyle = '#5A6B85';
+        ctx.font = '10px Inter, sans-serif';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+
+        for (let i = 0; i <= 5; i++) {{
+            const v = (maxVal / 5) * i;
+            const y = H - pad.b - v * yScale;
+            ctx.beginPath();
+            ctx.moveTo(pad.l, y);
+            ctx.lineTo(W - pad.r, y);
+            ctx.stroke();
+            ctx.fillText(v.toFixed(0) + '%', pad.l - 6, y);
+        }}
+
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        allDates.forEach((d, i) => {{
+            const x = pad.l + i * xStep;
+            const dt = new Date(d);
+            const mo = dt.toLocaleString('en', {{ month: 'short' }});
+            const yr = dt.getFullYear().toString().slice(2);
+            ctx.fillText(mo + ' ' + yr, x, H - pad.b + 10);
+        }});
+
+        labels.forEach((lbl, li) => {{
+            const color = CURRENCY_AVG_TS_COLORS[li % CURRENCY_AVG_TS_COLORS.length];
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            let started = false;
+
+            allDates.forEach((d, di) => {{
+                const raw = (CURRENCY_AVG_TS[lbl] || {{}})[d];
+                if (raw === undefined || raw === null) return;
+                const v = Number(raw);
+                if (Number.isNaN(v)) return;
+                const x = pad.l + di * xStep;
+                const y = H - pad.b - v * yScale;
+                if (!started) {{
+                    ctx.moveTo(x, y);
+                    started = true;
+                }} else {{
+                    ctx.lineTo(x, y);
+                }}
+            }});
+            ctx.stroke();
+        }});
+
+        legendEl.innerHTML = labels.map((l, i) =>
+            '<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' +
+            CURRENCY_AVG_TS_COLORS[i % CURRENCY_AVG_TS_COLORS.length] +
+            ';margin-right:4px;vertical-align:middle"></span>' + l + '</span>'
+        ).join('');
+    }}
+
+    window.addEventListener('load', drawCurrencyAverageTimeSeries);
+    window.addEventListener('resize', drawCurrencyAverageTimeSeries);
+    </script>'''
+
+    def _detail_rows(df):
+        if df.empty or 'Strategy' not in df.columns:
+            return pd.DataFrame()
+        strat_lower = df['Strategy'].astype(str).str.lower()
+        return df[
+            ~(strat_lower.str.contains('average', na=False) | strat_lower.str.contains('count', na=False))
+        ].copy()
+
+    def _median_exposure(detail_df, candidates):
+        for col in candidates:
+            if col not in detail_df.columns:
+                continue
+            vals = pd.to_numeric(detail_df[col], errors='coerce').dropna()
+            if len(vals) == 0:
+                continue
+            median_val = float(vals.median())
+            if median_val <= 1:
+                median_val *= 100
+            return round(max(0.0, min(100.0, median_val)), 4)
+        return None
+
+    currency_detail_df = _detail_rows(currency_df)
+    region_detail_df = _detail_rows(region_df)
+    country_detail_df = _detail_rows(country_df)
+
+    reconciliation_data = [
+        {
+            'pair': 'EUR vs Europe',
+            'currencyLabel': 'EUR',
+            'geoLabel': 'Europe',
+            'currencyValue': _median_exposure(currency_detail_df, ['EUR']),
+            'geoValue': _median_exposure(region_detail_df, ['Europe']),
+        },
+        {
+            'pair': 'GBP vs UK',
+            'currencyLabel': 'GBP',
+            'geoLabel': 'UK',
+            'currencyValue': _median_exposure(currency_detail_df, ['GBP']),
+            'geoValue': _median_exposure(country_detail_df, ['UK', 'United Kingdom', 'U.K.']),
+        },
+        {
+            'pair': 'USD vs N. America',
+            'currencyLabel': 'USD',
+            'geoLabel': 'N. America',
+            'currencyValue': _median_exposure(currency_detail_df, ['USD']),
+            'geoValue': _median_exposure(region_detail_df, ['N. America', 'North America']),
+        },
+    ]
+
+    reconciliation_json = _json.dumps(reconciliation_data)
+    currency_region_reconciliation_section = f'''
+    <div class="section-heading"><div class="bar"></div><h2>Currency-Region Reconciliation</h2></div>
+    <div class="card" style="padding:18px 20px 20px">
+        <div class="recon-wrap">
+            <div class="recon-header">Peer-group median exposure comparison</div>
+            <canvas id="recon-canvas" height="250" style="width:100%"></canvas>
+            <div id="recon-empty" class="hist-empty">No reconciliation data available</div>
+            <div class="recon-legend">
+                <span><i class="swatch swatch-currency"></i>Currency exposure</span>
+                <span><i class="swatch swatch-geo"></i>Geographic exposure</span>
+            </div>
+        </div>
+    </div>
+    <script>
+    const CURRENCY_REGION_RECON = {reconciliation_json};
+
+    function drawCurrencyRegionReconciliation() {{
+        const canvas = document.getElementById('recon-canvas');
+        const emptyState = document.getElementById('recon-empty');
+        if (!canvas || !emptyState) return;
+
+        const rows = (CURRENCY_REGION_RECON || []).filter(r =>
+            r && (r.currencyValue !== null || r.geoValue !== null)
+        );
+
+        if (!rows.length) {{
+            canvas.style.display = 'none';
+            emptyState.style.display = 'block';
+            return;
+        }}
+
+        canvas.style.display = 'block';
+        emptyState.style.display = 'none';
+
+        const dpr = window.devicePixelRatio || 1;
+        const width = canvas.offsetWidth;
+        const height = 250;
+        canvas.width = width * dpr;
+        canvas.height = height * dpr;
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.scale(dpr, dpr);
+
+        const W = width;
+        const H = height;
+        const pad = {{ l: 170, r: 26, t: 24, b: 30 }};
+        const chartW = W - pad.l - pad.r;
+        const rowGap = 68;
+        const barH = 14;
+
+        ctx.clearRect(0, 0, W, H);
+
+        const ticks = [0, 25, 50, 75, 100];
+        ctx.font = '10px Inter, sans-serif';
+        ctx.fillStyle = '#5A6B85';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ticks.forEach((t) => {{
+            const x = pad.l + (t / 100) * chartW;
+            ctx.strokeStyle = 'rgba(221, 216, 209, 0.8)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(x, pad.t - 8);
+            ctx.lineTo(x, H - pad.b);
+            ctx.stroke();
+            ctx.fillText(t + '%', x, H - pad.b + 4);
+        }});
+
+        rows.forEach((row, i) => {{
+            const yBase = pad.t + i * rowGap + 18;
+            const yCurrency = yBase - 10;
+            const yGeo = yBase + 10;
+
+            ctx.fillStyle = '#0E1C47';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'middle';
+            ctx.font = '12px Inter, sans-serif';
+            ctx.fillText(row.pair, 12, yBase);
+
+            const currencyVal = row.currencyValue;
+            if (currencyVal !== null && currencyVal !== undefined) {{
+                const w = (Math.max(0, Math.min(100, Number(currencyVal))) / 100) * chartW;
+                ctx.fillStyle = '#1E96D7';
+                ctx.fillRect(pad.l, yCurrency - barH / 2, w, barH);
+                ctx.fillStyle = '#1E96D7';
+                ctx.font = '11px Inter, sans-serif';
+                ctx.fillText(row.currencyLabel + ' ' + Number(currencyVal).toFixed(1) + '%', pad.l + w + 8, yCurrency);
+            }} else {{
+                ctx.fillStyle = '#8DA1BE';
+                ctx.font = '11px Inter, sans-serif';
+                ctx.fillText(row.currencyLabel + ' n/a', pad.l + 6, yCurrency);
+            }}
+
+            const geoVal = row.geoValue;
+            if (geoVal !== null && geoVal !== undefined) {{
+                const w = (Math.max(0, Math.min(100, Number(geoVal))) / 100) * chartW;
+                ctx.fillStyle = '#192D6E';
+                ctx.fillRect(pad.l, yGeo - barH / 2, w, barH);
+                ctx.fillStyle = '#192D6E';
+                ctx.font = '11px Inter, sans-serif';
+                ctx.fillText(row.geoLabel + ' ' + Number(geoVal).toFixed(1) + '%', pad.l + w + 8, yGeo);
+            }} else {{
+                ctx.fillStyle = '#8DA1BE';
+                ctx.font = '11px Inter, sans-serif';
+                ctx.fillText(row.geoLabel + ' n/a', pad.l + 6, yGeo);
+            }}
+        }});
+    }}
+
+    window.addEventListener('load', drawCurrencyRegionReconciliation);
+    window.addEventListener('resize', drawCurrencyRegionReconciliation);
+    </script>'''
+
+    ts_section = ''
+    if normalised_timeseries:
+        ts_json = _json.dumps(normalised_timeseries, default=str)
+        managers = sorted(normalised_timeseries.keys())
+        mgr_options = ''.join(f'<option value="{html.escape(m)}">{html.escape(m)}</option>' for m in managers)
+        ts_section = f'''
+    <div class="section-heading"><div class="bar"></div><h2>Exposure Over Time</h2></div>
+    <div class="card" style="padding:20px">
+        <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
+            <label style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent)">Manager</label>
+            <select id="ts-mgr" onchange="handleManagerChange()" style="padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:13px;color:var(--text);background:var(--bg-card);min-width:280px">
+                {mgr_options}
+            </select>
+            <label style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent);margin-left:12px">View</label>
+            <select id="ts-view" onchange="updateChart()" style="padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:13px;color:var(--text);background:var(--bg-card)">
+                <option value="Currency">Currency</option>
+                <option value="Region">Region</option>
+                <option value="Country">Country</option>
+            </select>
+        </div>
+        <canvas id="ts-canvas" height="340" style="width:100%"></canvas>
+        <div id="ts-legend" style="display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:12px;font-size:11px;color:var(--text-muted)"></div>
+    </div>
+    <script>
+    const TS_DATA = {ts_json};
+    const COLORS = ['#192D6E','#1E96D7','#85D0CD','#DC5F87','#FEC35A','#436AB3','#47B8B4','#8B5CF6','#F97316','#059669','#E11D48','#6366F1','#0EA5E9','#D946EF','#84CC16'];
+
+    function getManagerViews(mgrData) {{
+        const rawViews = new Set();
+        Object.keys(mgrData || {{}}).forEach((key) => {{
+            const sec = key.split('|')[0];
+            if (sec) rawViews.add(sec);
+        }});
+        const preferred = ['Currency', 'Region', 'Country'];
+        const ordered = preferred.filter(v => rawViews.has(v));
+        Array.from(rawViews).sort().forEach(v => {{
+            if (!ordered.includes(v)) ordered.push(v);
+        }});
+        return ordered;
+    }}
+
+    function populateViewOptions() {{
+        const mgr = document.getElementById('ts-mgr').value;
+        const mgrData = TS_DATA[mgr] || {{}};
+        const viewSelect = document.getElementById('ts-view');
+        const currentView = viewSelect.value;
+        const views = getManagerViews(mgrData);
+
+        viewSelect.innerHTML = '';
+        if (!views.length) {{
+            viewSelect.innerHTML = '<option value="">No data</option>';
+            viewSelect.disabled = true;
+            return '';
+        }}
+
+        viewSelect.disabled = false;
+        views.forEach((v) => {{
+            const opt = document.createElement('option');
+            opt.value = v;
+            opt.textContent = v;
+            viewSelect.appendChild(opt);
+        }});
+
+        const nextView = views.includes(currentView) ? currentView : views[0];
+        viewSelect.value = nextView;
+        return nextView;
+    }}
+
+    function handleManagerChange() {{
+        populateViewOptions();
+        updateChart();
+    }}
+
+    function updateChart() {{
+        const mgr = document.getElementById('ts-mgr').value;
+        const view = document.getElementById('ts-view').value;
+        const canvas = document.getElementById('ts-canvas');
+        const ctx = canvas.getContext('2d');
+        const legend = document.getElementById('ts-legend');
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = canvas.offsetWidth * dpr;
+        canvas.height = 340 * dpr;
+        ctx.scale(dpr, dpr);
+        const W = canvas.offsetWidth, H = 340;
+        ctx.clearRect(0, 0, W, H);
+        const mgrData = TS_DATA[mgr];
+        if (!mgrData || !view) {{ legend.innerHTML = '<span>No time-series data for this manager</span>'; return; }}
+        const series = {{}};
+        Object.entries(mgrData).forEach(([key, vals]) => {{
+            const parts = key.split('|');
+            const sec = parts[0];
+            const lbl = parts[1];
+            if (sec === view) series[lbl] = vals;
+        }});
+        const labels = Object.keys(series);
+        if (!labels.length) {{ legend.innerHTML = '<span>No ' + view.toLowerCase() + ' data</span>'; return; }}
+        const allDates = [...new Set(labels.flatMap(l => Object.keys(series[l])))].sort();
+        const pad = {{l:60, r:20, t:20, b:50}};
+        let maxVal = 0;
+        labels.forEach(l => Object.values(series[l]).forEach(v => {{ if (v > maxVal) maxVal = v; }}));
+        maxVal = Math.ceil(maxVal / 10) * 10 || 100;
+        const xStep = (W - pad.l - pad.r) / Math.max(allDates.length - 1, 1);
+        const yScale = (H - pad.t - pad.b) / maxVal;
+        ctx.strokeStyle = 'var(--border)' in ctx ? '#DDD8D1' : '#DDD8D1';
+        ctx.lineWidth = 0.5;
+        ctx.fillStyle = '#5A6B85'; ctx.font = '10px Inter, sans-serif'; ctx.textAlign = 'right';
+        for (let i = 0; i <= 5; i++) {{
+            const v = (maxVal / 5) * i;
+            const y = H - pad.b - v * yScale;
+            ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+            ctx.fillText(v.toFixed(0) + '%', pad.l - 6, y + 4);
+        }}
+        ctx.textAlign = 'center';
+        allDates.forEach((d, i) => {{
+            const x = pad.l + i * xStep;
+            const dt = new Date(d);
+            const mo = dt.toLocaleString('en', {{month:'short'}});
+            const yr = dt.getFullYear().toString().slice(2);
+            ctx.fillText(mo + ' ' + yr, x, H - pad.b + 18);
+        }});
+        labels.forEach((lbl, li) => {{
+            const color = COLORS[li % COLORS.length];
+            ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+            let started = false;
+            allDates.forEach((d, di) => {{
+                let v = series[lbl][d];
+                if (v === undefined || v === null) return;
+                const x = pad.l + di * xStep;
+                const y = H - pad.b - v * yScale;
+                if (!started) {{ ctx.moveTo(x, y); started = true; }}
+                else ctx.lineTo(x, y);
+            }});
+            ctx.stroke();
+            allDates.forEach((d, di) => {{
+                let v = series[lbl][d];
+                if (v === undefined || v === null) return;
+                const x = pad.l + di * xStep;
+                const y = H - pad.b - v * yScale;
+                ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+                ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
+            }});
+        }});
+        legend.innerHTML = labels.map((l, i) => '<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + COLORS[i % COLORS.length] + ';margin-right:4px;vertical-align:middle"></span>' + l + '</span>').join('');
+    }}
+    window.addEventListener('load', () => {{ populateViewOptions(); updateChart(); }});
+    window.addEventListener('resize', updateChart);
+    </script>'''
+
+    html_content = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GHY Manager Responses — Consolidated Data</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+:root {{
+    --bg-primary: #F7F5F2;
+    --bg-card: #FFFFFF;
+    --border: #DDD8D1;
+    --border-subtle: #EDE9E4;
+    --accent: #192D6E;
+    --accent2: #1E96D7;
+    --text: #192D6E;
+    --text-heading: #0E1C47;
+    --text-muted: #5A6B85;
+    --text-dim: #8DA1BE;
+    --bg-table-header: rgba(25,45,110,0.06);
+    --hover-overlay: rgba(25,45,110,0.04);
+    --shadow-card: 0 1px 3px rgba(25,45,110,0.06), 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-card-hover: 0 4px 16px rgba(25,45,110,0.10);
+    --positive: #1A8F5C;
+    --negative: #DC2626;
+    --nav-h: 52px;
+}}
+@font-face {{ font-family: 'Mediolanum Sans'; src: local('Mediolanum Sans'), local('MediolanumSans'), local('Mediolanum Sans Regular'); font-weight: 400; }}
+@font-face {{ font-family: 'Mediolanum Sans'; src: local('Mediolanum Sans Bold'), local('MediolanumSans-Bold'); font-weight: 700; }}
+@font-face {{ font-family: 'Mediolanum Sans'; src: local('Mediolanum Sans Light'), local('MediolanumSans-Light'); font-weight: 300; }}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    font-family: 'Mediolanum Sans', 'Inter', system-ui, -apple-system, sans-serif;
+    background: var(--bg-primary); color: var(--text); line-height: 1.6; font-size: 13px;
+}}
+
+/* ─── Sticky Nav with cross pattern ─────────────────────────────── */
+.top-nav {{
+    position: sticky; top: 0; z-index: 1000;
+    background: linear-gradient(135deg, #192D6E 0%, #1E96D7 60%, #85D0CD 100%);
+    display: flex; align-items: center; gap: 16px;
+    padding: 0 32px; height: var(--nav-h);
+    box-shadow: 0 4px 30px rgba(25,45,110,0.25);
+    overflow: hidden;
+}}
+.top-nav::before {{
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.03'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E") repeat;
+    pointer-events: none;
+}}
+.top-nav > * {{ position: relative; z-index: 1; }}
+.nav-logo {{ height: 24px; margin-right: 8px; }}
+.brand {{ font-size: 14px; font-weight: 700; color: #FFFFFF; letter-spacing: 1.5px; text-transform: uppercase; text-shadow: 0 1px 3px rgba(0,0,0,0.15); }}
+.nav-subtitle {{ font-size: 12px; color: rgba(255,255,255,0.7); font-weight: 400; margin-left: 12px; }}
+.nav-right {{ margin-left: auto; font-size: 11px; color: rgba(255,255,255,0.6); }}
+
+/* ─── Layout ────────────────────────────────────────────────────── */
+.container {{ max-width: 1600px; margin: 0 auto; padding: 2rem; }}
+
+/* ─── KPI Banner ────────────────────────────────────────────────── */
+.kpi-row {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px; margin-bottom: 24px;
+}}
+.kpi-card {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 16px;
+    text-align: center;
+    box-shadow: var(--shadow-card);
+    transition: all .25s ease;
+}}
+.kpi-card:hover {{ box-shadow: var(--shadow-card-hover); transform: translateY(-2px); }}
+.kpi-val {{
+    font-size: 28px; font-weight: 800; color: var(--accent);
+    font-variant-numeric: tabular-nums; letter-spacing: -0.5px;
+}}
+.kpi-lbl {{
+    font-size: 10px; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 1.5px; margin-top: 2px;
+}}
+
+/* ─── Section headings ──────────────────────────────────────────── */
+.section-heading {{
+    display: flex; align-items: center; gap: 12px;
+    margin: 28px 0 16px;
+}}
+.section-heading .bar {{
+    width: 4px; height: 24px; border-radius: 2px;
+    background: linear-gradient(180deg, var(--accent), var(--accent2));
+}}
+.section-heading h2 {{
+    font-size: 16px; font-weight: 700; color: var(--text-heading);
+    text-transform: uppercase; letter-spacing: 0.8px;
+}}
+
+/* ─── Cards ─────────────────────────────────────────────────────── */
+.card {{
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+    transition: all .25s ease;
+    margin-bottom: 20px;
+}}
+.card:hover {{ box-shadow: var(--shadow-card-hover); transform: translateY(-1px); }}
+.card-header {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 20px;
+    background: var(--bg-table-header);
+    border-bottom: 1px solid var(--border-subtle);
+}}
+.card-header h3 {{
+    font-size: 12px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .6px;
+    color: var(--accent);
+}}
+.card-header .meta {{ font-size: 11px; color: var(--text-muted); }}
+
+/* ─── Tables ────────────────────────────────────────────────────── */
+.data-table {{
+    width: 100%; border-collapse: collapse;
+    font-size: 13px; font-variant-numeric: tabular-nums;
+}}
+.data-table th {{
+    background: var(--bg-table-header);
+    font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .5px;
+    color: var(--accent);
+    padding: 11px 16px; text-align: left;
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+}}
+.card > .data-table th {{
+    position: sticky; top: var(--nav-h); z-index: 800;
+}}
+.data-table td {{
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text);
+}}
+.data-table tr:hover td {{ background: var(--hover-overlay); }}
+.data-table tr:last-child td {{ border-bottom: none; }}
+td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+.agg-row {{ background: var(--bg-table-header); font-weight: 700; }}
+.agg-row td {{ border-top: 2px solid var(--border); }}
+
+/* ─── Tooltip component ─────────────────────────────────────────── */
+.has-tip {{
+    position: relative; cursor: help;
+}}
+.has-tip::after {{
+    content: '+'; font-size: 8px; font-weight: 800;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 14px; height: 14px; border-radius: 4px;
+    background: rgba(30,150,215,0.12); color: var(--accent2);
+    margin-left: 5px; vertical-align: middle;
+    line-height: 1;
+}}
+.has-tip .tip-box {{
+    display: none; position: absolute; bottom: calc(100% + 8px); left: 50%;
+    transform: translateX(-50%); z-index: 9999;
+    background: var(--text-heading); color: #fff; font-size: 11px; font-weight: 400;
+    padding: 10px 14px; border-radius: 8px; line-height: 1.5;
+    width: max-content; max-width: 380px; white-space: pre-wrap;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+    pointer-events: none;
+}}
+.has-tip .tip-box::after {{
+    content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+    border: 6px solid transparent; border-top-color: var(--text-heading);
+}}
+.has-tip:hover .tip-box {{ display: block; }}
+
+/* ─── Benchmark tags ────────────────────────────────────────────── */
+.bmk-tag {{
+    display: inline-block; padding: 3px 10px; border-radius: 6px;
+    font-size: 11px; font-weight: 600;
+    letter-spacing: 0.3px;
+}}
+.bmk-none {{
+    background: rgba(220,38,38,0.08); color: #DC2626;
+    border: 1px solid rgba(220,38,38,0.15);
+}}
+.bmk-custom {{
+    background: rgba(30,150,215,0.08); color: #1E96D7;
+    border: 1px solid rgba(30,150,215,0.15);
+}}
+.has-tip .bmk-tag {{ border-bottom: none; }}
+
+/* ─── Tabs ──────────────────────────────────────────────────────── */
+.tab-bar {{
+    display: flex; gap: 4px; margin-bottom: 0;
+    padding: 0 20px;
+    background: var(--bg-table-header);
+    border-bottom: 1px solid var(--border-subtle);
+}}
+.tab-btn {{
+    padding: 10px 20px; border: none; background: none;
+    font-family: inherit; font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--text-muted); cursor: pointer;
+    border-bottom: 3px solid transparent; margin-bottom: -1px;
+    transition: all 0.2s;
+}}
+.tab-btn:hover {{ color: var(--accent); }}
+.tab-btn.active {{
+    color: var(--accent);
+    border-bottom-color: var(--accent2);
+}}
+.tab-panel {{ display: none; }}
+.tab-panel.active {{ display: block; padding: 0; }}
+.tab-spacer {{ flex: 1; }}
+.summary-toggle {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}}
+.summary-toggle input {{ accent-color: var(--accent2); }}
+body.summary-only .tab-panel .detail-row {{ display: none; }}
+body.headline-summary-only .headline-detail {{ display: none; }}
+
+/* ─── Currency Deep Dive ────────────────────────────────────────── */
+.deep-dive-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 14px;
+}}
+.hist-panel {{
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 12px;
+    background: linear-gradient(180deg, rgba(255,255,255,1) 0%, rgba(247,245,242,0.4) 100%);
+}}
+.hist-title {{
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 8px;
+}}
+.hist-empty {{
+    display: none;
+    color: var(--text-muted);
+    font-size: 12px;
+    padding: 16px 0;
+    text-align: center;
+}}
+
+/* ─── Currency-Region Reconciliation ───────────────────────────── */
+.recon-wrap {{
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 12px;
+    background: linear-gradient(180deg, rgba(255,255,255,1) 0%, rgba(247,245,242,0.35) 100%);
+}}
+.recon-header {{
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 8px;
+}}
+.recon-legend {{
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 10px;
+}}
+.swatch {{
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    margin-right: 6px;
+    vertical-align: middle;
+}}
+.swatch-currency {{ background: #1E96D7; }}
+.swatch-geo {{ background: #192D6E; }}
+
+/* ─── Process Tile ─────────────────────────────────────────────── */
+.process-card {{
+    padding: 28px;
+    background:
+        radial-gradient(circle at 10% 0%, rgba(30,150,215,0.10) 0%, rgba(30,150,215,0) 45%),
+        radial-gradient(circle at 95% 85%, rgba(133,208,205,0.16) 0%, rgba(133,208,205,0) 50%),
+        var(--bg-card);
+}}
+.process-intro {{
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 16px;
+    margin-bottom: 20px;
+    border-bottom: 1px dashed var(--border);
+    padding-bottom: 16px;
+}}
+.process-title {{
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--text-heading);
+}}
+.process-meta {{
+    font-size: 13px;
+    color: var(--text-muted);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+}}
+.process-grid {{
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px;
+}}
+.process-step {{
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    padding: 20px 18px 16px;
+    background: linear-gradient(180deg, #ffffff 0%, rgba(247,245,242,0.5) 100%);
+    box-shadow: 0 1px 2px rgba(25,45,110,0.04);
+}}
+.process-step-head {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}}
+.step-num {{
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 800;
+    color: #fff;
+    background: linear-gradient(180deg, var(--accent2), var(--accent));
+    box-shadow: 0 3px 8px rgba(25,45,110,0.22);
+}}
+.process-step h4 {{
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--accent);
+}}
+.process-step p {{
+    font-size: 14px;
+    line-height: 1.7;
+    color: var(--text);
+}}
+
+@media (max-width: 980px) {{
+    .process-grid {{
+        grid-template-columns: 1fr;
+    }}
+    .process-intro {{
+        align-items: flex-start;
+        flex-direction: column;
+    }}
+}}
+
+/* ─── Footer ────────────────────────────────────────────────────── */
+.footer {{
+    text-align: center; padding-top: 1.5rem; margin-top: 2rem;
+    border-top: 2px solid var(--border);
+    color: var(--text-dim); font-size: 11px;
+}}
+
+/* ─── Print ─────────────────────────────────────────────────────── */
+@media print {{
+    .top-nav {{ position: relative; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    .container {{ padding: 16px; }}
+    body {{ font-size: 11px; background: #fff; }}
+    .data-table th {{ position: static; }}
+    .tab-bar {{ display: none; }}
+    .tab-panel {{ display: block !important; }}
+}}
+@page {{ size: A3 landscape; margin: 12mm; }}
+</style>
+</head>
+<body>
+
+<nav class="top-nav">
+    {"<img src='data:image/png;base64," + logo_b64 + "' alt='Mediolanum' class='nav-logo'>" if logo_b64 else ""}
+    <span class="brand">GHY Manager Responses</span>
+    <span class="nav-subtitle">Consolidated Data</span>
+    <span class="nav-right">Refreshed: {now}</span>
+</nav>
+
+<div class="container">
+
+    <div class="kpi-row">
+        <div class="kpi-card"><div class="kpi-val">{n_managers}</div><div class="kpi-lbl">Managers Responded</div></div>
+        <div class="kpi-card"><div class="kpi-val">{len(currency_df) - 2 if len(currency_df) > 2 else 0}</div><div class="kpi-lbl">With Currency Data</div></div>
+        <div class="kpi-card"><div class="kpi-val">{len(country_df.columns) - 1 if not country_df.empty else 0}</div><div class="kpi-lbl">Countries Covered</div></div>
+        <div class="kpi-card"><div class="kpi-val">{today}</div><div class="kpi-lbl">Report Date</div></div>
+    </div>
+
+    <div class="section-heading"><div class="bar"></div><h2>Process</h2></div>
+    <div class="card process-card">
+        <div class="process-intro">
+            <div class="process-title">How This Dashboard Is Built</div>
+            <div class="process-meta">Three-step workflow from outreach to validation</div>
+        </div>
+        <div class="process-grid">
+            <article class="process-step">
+                <div class="process-step-head">
+                    <span class="step-num">1</span>
+                    <h4>Manager Outreach</h4>
+                </div>
+                <p>Reached out to managers in the peer group and requested their RFPs plus specific data on currency, region, and country exposures, while maintaining a structured tracking sheet.</p>
+            </article>
+            <article class="process-step">
+                <div class="process-step-head">
+                    <span class="step-num">2</span>
+                    <h4>Data Consolidation</h4>
+                </div>
+                <p>Scraped and standardized the submitted files, then collated the outputs into one consolidated Excel model that powers this HTML dashboard.</p>
+            </article>
+            <article class="process-step">
+                <div class="process-step-head">
+                    <span class="step-num">3</span>
+                    <h4>Spot-Check QA</h4>
+                </div>
+                <p>Conducted targeted spot checks to verify that the right manager data is being pulled, transformed, and displayed correctly across all sections.</p>
+            </article>
+        </div>
+    </div>
+
+    <div class="section-heading"><div class="bar"></div><h2>Headline Statistics</h2></div>
+    <div class="card">
+        <div class="card-header">
+            <h3>Key fund characteristics</h3>
+            <span class="meta">{n_managers} strategies</span>
+            <label class="summary-toggle" style="margin-left:12px">
+                <input type="checkbox" id="headline-summary-toggle" onchange="toggleHeadlineSummaryOnly(this.checked)">
+                Collapse manager lines
+            </label>
+        </div>
+        <table class="data-table">
+        <thead><tr>
+            <th>Manager</th><th>Fund Name</th><th>ISIN</th><th>Assets (EUR M)</th>
+            <th>Benchmark</th><th>YTM (%)</th><th>OAS (bps)</th>
+            <th>Duration (yrs)</th><th>Avg Rating</th><th># Issues</th>
+            <th>Domicile</th><th>UCITS</th><th>As Of</th>
+        </tr></thead>
+        <tbody>
+        {headline_rows}
+        </tbody>
+        </table>
+    </div>
+
+    <div class="section-heading"><div class="bar"></div><h2>Geographic & Currency Breakdowns</h2></div>
+    <div class="card">
+        <div class="tab-bar">
+            <button class="tab-btn active" onclick="switchTab('currency')">Currency</button>
+            <button class="tab-btn" onclick="switchTab('region')">Region</button>
+            <button class="tab-btn" onclick="switchTab('country')">Country</button>
+            <span class="tab-spacer"></span>
+            <label class="summary-toggle">
+                <input type="checkbox" id="summary-only-toggle" onchange="toggleSummaryOnly(this.checked)">
+                Collapse manager lines
+            </label>
+        </div>
+
+        <div id="tab-currency" class="tab-panel active">
+            {currency_month_filter_section}
+            {currency_table}
+        </div>
+        <div id="tab-region" class="tab-panel">
+            {region_table}
+        </div>
+        <div id="tab-country" class="tab-panel">
+            {country_table}
+        </div>
+    </div>
+
+    {currency_deep_dive_section}
+
+    {currency_region_reconciliation_section}
+
+    {ts_section}
+
+</div>
+
+<div class="footer">
+    MIO Manager Selection &mdash; Auto-generated {now} &mdash; For internal use only
+</div>
+
+<script>
+function switchTab(id) {{
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + id).classList.add('active');
+    event.target.classList.add('active');
+}}
+
+function toggleSummaryOnly(enabled) {{
+    document.body.classList.toggle('summary-only', enabled);
+}}
+
+function toggleHeadlineSummaryOnly(enabled) {{
+    document.body.classList.toggle('headline-summary-only', enabled);
+}}
+</script>
+</body>
+</html>'''
+
+    output_path = output_dir / OUTPUT_HTML
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    print(f"HTML saved: {output_path}")
+
+
+if __name__ == '__main__':
+    base = find_sharepoint_folder()
+    print(f"SharePoint folder: {base}")
+    print("Processing GHY Manager Responses...\n")
+
+    headline_df, currency_df, region_df, country_df, timeseries = process_all_managers(base)
+
+    print(f"\nHeadline stats: {len(headline_df)} strategies")
+    print(f"Currency breakdown: {len(currency_df)} rows, {len(currency_df.columns)} cols")
+    print(f"Region breakdown: {len(region_df)} rows, {len(region_df.columns)} cols")
+    print(f"Country breakdown: {len(country_df)} rows, {len(country_df.columns)} cols")
+    print(f"Time-series data: {len(timeseries)} managers")
+
+    output_dir = Path(base)
+    save_to_excel(headline_df, currency_df, region_df, country_df, output_dir)
+    generate_html(headline_df, currency_df, region_df, country_df, output_dir, timeseries)
+    print("\nDone! Files will sync to SharePoint automatically via OneDrive.")

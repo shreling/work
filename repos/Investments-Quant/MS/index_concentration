@@ -1,0 +1,165 @@
+"""
+Pull index constituent weights from Snowflake and chart top-20 weight evolution over time.
+
+The script:
+1. Runs the query for INDEX_IDs 10001, 10011, 10013 from January 2008 onward.
+2. For each index, picks the top 20 constituents on the latest DATA_DATE.
+3. Plots those 20 constituents' weights through time.
+4. Saves one combined chart with one line per INDEX_ID.
+
+Usage:
+	python MS/index_concentration
+"""
+
+import importlib.util
+import os
+import sys
+from pathlib import Path
+from typing import List
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import pandas as pd
+import snowflake.connector
+
+
+# Support importing shared config from Utilities regardless of current working directory.
+SCRIPT_PATH = Path(__file__).resolve()
+SCRIPT_DIR = SCRIPT_PATH.parent
+REPO_ROOT = SCRIPT_DIR.parent
+UTILITIES_DIR = REPO_ROOT / "Utilities"
+if str(UTILITIES_DIR) not in sys.path:
+	sys.path.insert(0, str(UTILITIES_DIR))
+
+try:
+	import snowflake_connector_config as config
+except ModuleNotFoundError:
+	config_path = UTILITIES_DIR / "snowflake_connector_config.py"
+	if not config_path.exists():
+		raise ModuleNotFoundError(
+			"Could not find Utilities/snowflake_connector_config.py. "
+			"Check that the file exists in the repo Utilities folder."
+		)
+	config_spec = importlib.util.spec_from_file_location("snowflake_connector_config", config_path)
+	if config_spec is None or config_spec.loader is None:
+		raise ModuleNotFoundError("Unable to load snowflake_connector_config.py")
+	config = importlib.util.module_from_spec(config_spec)
+	sys.modules["snowflake_connector_config"] = config
+	config_spec.loader.exec_module(config)
+
+
+INDEX_ID_TO_NAME = {
+	10001: "MSCI World",
+	10011: "MSCI USA",
+	10013: "MSCI Emerging Market",
+}
+
+INDEX_IDS = list(INDEX_ID_TO_NAME.keys())
+
+QUERY_TEMPLATE = """
+SELECT INDEX_ID, DATA_DATE, PROPER_NAME, WGT, REGION, GICS_SECTOR
+FROM QUANT.WORKING.UNIVERSE_INDICES
+WHERE INDEX_ID IN ({index_id_csv})
+	AND DATA_DATE >= '2008-01-01'
+	AND LEVEL IS NOT NULL
+ORDER BY INDEX_ID, DATA_DATE
+"""
+
+
+def get_snowflake_connection() -> snowflake.connector.SnowflakeConnection:
+	return snowflake.connector.connect(
+		user=config.user,
+		password=config.password,
+		account=config.account,
+	)
+
+
+def fetch_index_data(index_ids: List[int]) -> pd.DataFrame:
+	index_id_csv = ", ".join(str(int(i)) for i in index_ids)
+	query = QUERY_TEMPLATE.format(index_id_csv=index_id_csv)
+
+	conn = get_snowflake_connection()
+	try:
+		df = pd.read_sql(query, conn)
+	finally:
+		conn.close()
+
+	if df.empty:
+		raise ValueError("No rows returned from Snowflake query.")
+
+	df.columns = [c.upper() for c in df.columns]
+	df["DATA_DATE"] = pd.to_datetime(df["DATA_DATE"])
+	df["WGT"] = pd.to_numeric(df["WGT"], errors="coerce")
+	return df.dropna(subset=["INDEX_ID", "DATA_DATE", "PROPER_NAME", "WGT"])
+
+
+def top_20_on_latest_date(df_index: pd.DataFrame) -> List[str]:
+	latest_date = df_index["DATA_DATE"].max()
+	latest_slice = df_index[df_index["DATA_DATE"] == latest_date].copy()
+	latest_slice = latest_slice.sort_values("WGT", ascending=False)
+	return latest_slice.head(20)["PROPER_NAME"].tolist()
+
+
+def maybe_convert_to_percent(series: pd.Series) -> tuple[pd.Series, str]:
+	"""
+	Convert decimal weights to percentages if values look like fractions.
+
+	Rule: if max absolute weight <= 1.5, treat as fraction and multiply by 100.
+	"""
+	max_abs = series.abs().max()
+	if pd.notna(max_abs) and max_abs <= 1.5:
+		return series * 100.0, "Weight (%)"
+	return series, "Weight"
+
+
+def plot_top20_evolution(df: pd.DataFrame, index_ids: List[int], output_path: str) -> None:
+	fig, ax = plt.subplots(1, 1, figsize=(14, 7))
+	y_label = "Weight"
+
+	for index_id in index_ids:
+		df_index = df[df["INDEX_ID"] == index_id].copy()
+		if df_index.empty:
+			continue
+
+		top20_names = top_20_on_latest_date(df_index)
+		df_top20 = df_index[df_index["PROPER_NAME"].isin(top20_names)].copy()
+
+		agg_series = (
+			df_top20.groupby("DATA_DATE", as_index=True)["WGT"]
+			.sum()
+			.sort_index()
+		)
+
+		agg_series, y_label = maybe_convert_to_percent(agg_series)
+		index_name = INDEX_ID_TO_NAME.get(index_id, str(index_id))
+		ax.plot(agg_series.index, agg_series.values, linewidth=2.2, label=index_name)
+
+	ax.set_title("Top 20 Constituent Weight Sum Through Time (Latest-Date Top 20 Selection)")
+	ax.set_ylabel(y_label)
+	ax.grid(alpha=0.25)
+	ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+	ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+	ax.tick_params(axis="x", rotation=45)
+	ax.legend(loc="best", frameon=False)
+
+	plt.tight_layout()
+	fig.savefig(output_path, dpi=160, bbox_inches="tight")
+	plt.close(fig)
+
+
+def main() -> None:
+	selected_names = [INDEX_ID_TO_NAME.get(i, str(i)) for i in INDEX_IDS]
+	print(f"Querying Snowflake for: {', '.join(selected_names)}")
+	df = fetch_index_data(INDEX_IDS)
+	print(f"Fetched {len(df):,} rows.")
+
+	output_dir = os.path.join(SCRIPT_DIR, "index_concentration_output")
+	os.makedirs(output_dir, exist_ok=True)
+	output_chart = os.path.join(output_dir, "top20_weight_evolution_by_index.png")
+
+	plot_top20_evolution(df, INDEX_IDS, output_chart)
+	print(f"Chart saved to: {output_chart}")
+
+
+if __name__ == "__main__":
+	main()
