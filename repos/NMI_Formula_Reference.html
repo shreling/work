@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>New Manager Input – Formula Reference</title>
+    <style>
+        @media print { body { margin: 0.5in; } }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #0d1b2a; line-height: 1.6; padding: 40px; max-width: 900px; margin: 0 auto; }
+        h1 { color: #003781; font-size: 24px; border-bottom: 3px solid #003781; padding-bottom: 8px; margin-bottom: 24px; }
+        h2 { color: #003781; font-size: 18px; margin-top: 28px; margin-bottom: 8px; border-left: 4px solid #003781; padding-left: 12px; }
+        .section { background: #f8fafd; border: 1px solid #c8d8ec; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+        .formula { background: #eef3fa; border-radius: 6px; padding: 10px 16px; margin: 8px 0; font-family: 'Consolas', 'Courier New', monospace; font-size: 14px; color: #003781; }
+        .note { font-size: 13px; color: #5a6e84; margin-top: 4px; }
+        .var { color: #1a7f4b; font-weight: 600; }
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+        th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #c8d8ec; font-size: 13px; }
+        th { background: #003781; color: #fff; }
+        .back-link { display: inline-block; margin-bottom: 20px; color: #003781; text-decoration: none; font-weight: 600; }
+        .back-link:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <a class="back-link" href="MS_Manager_Returns_Dashboard.html">← Back to Dashboard</a>
+    <h1>New Manager Input – Formula Reference</h1>
+    <p style="margin-bottom:24px; color:#5a6e84;">All formulas used in the New Manager Input analytics page. Monthly returns are expressed as decimals (e.g. 0.02 = 2%).</p>
+
+    <!-- Variable definitions -->
+    <h2>Common Variables</h2>
+    <div class="section">
+        <table>
+            <tr><th>Symbol</th><th>Definition</th></tr>
+            <tr><td><span class="var">r<sub>i</sub></span></td><td>Manager monthly return in month i</td></tr>
+            <tr><td><span class="var">b<sub>i</sub></span></td><td>Benchmark monthly return in month i</td></tr>
+            <tr><td><span class="var">e<sub>i</sub></span></td><td>Excess return = r<sub>i</sub> − b<sub>i</sub></td></tr>
+            <tr><td><span class="var">n</span></td><td>Number of monthly observations</td></tr>
+            <tr><td><span class="var">w</span></td><td>Rolling window size (months), e.g. 36 for 3Y</td></tr>
+        </table>
+    </div>
+
+    <!-- 1. Cumulative Return Index -->
+    <h2>1. Cumulative Return Index</h2>
+    <div class="section">
+        <p>Both manager and benchmark cumulative indices start at 100 and compound monthly.</p>
+        <div class="formula">Cumul<sub>0</sub> = 100<br>Cumul<sub>t</sub> = Cumul<sub>t−1</sub> × (1 + r<sub>t</sub>)</div>
+        <p class="note">Benchmark index uses b<sub>i</sub> instead of r<sub>i</sub>. Where benchmark data is missing, return is treated as 0.</p>
+    </div>
+
+    <!-- 2. Annualised Return -->
+    <h2>2. Annualised Return</h2>
+    <div class="section">
+        <div class="formula">Total Return = Cumul<sub>n</sub> / 100<br>Years = n / 12<br>Ann. Return = (Total Return<sup>1/Years</sup> − 1) × 100</div>
+    </div>
+
+    <!-- 3. Annualised Volatility -->
+    <h2>3. Annualised Volatility</h2>
+    <div class="section">
+        <div class="formula">μ = (1/n) × Σ r<sub>i</sub><br>σ<sub>monthly</sub> = √[ Σ(r<sub>i</sub> − μ)² / (n − 1) ]<br>Ann. Volatility = σ<sub>monthly</sub> × √12 × 100</div>
+        <p class="note">Uses sample standard deviation (n−1 denominator).</p>
+    </div>
+
+    <!-- 4. Tracking Error -->
+    <h2>4. Tracking Error</h2>
+    <div class="section">
+        <div class="formula">ē = (1/m) × Σ e<sub>i</sub>  (where m = count of months with benchmark data)<br>σ<sub>excess</sub> = √[ Σ(e<sub>i</sub> − ē)² / (m − 1) ]<br>Tracking Error = σ<sub>excess</sub> × √12 × 100</div>
+        <p class="note">Only months where benchmark data exists are included.</p>
+    </div>
+
+    <!-- 5. Information Ratio (Full Period) -->
+    <h2>5. Information Ratio (Full Period)</h2>
+    <div class="section">
+        <div class="formula">IR = (ē × 12) / (Tracking Error / 100)</div>
+        <p class="note">Annualised excess return divided by annualised tracking error.</p>
+    </div>
+
+    <!-- 6. Rolling Information Ratio -->
+    <h2>6. Rolling Information Ratio</h2>
+    <div class="section">
+        <div class="formula">For each rolling window of w months ending at month t:<br>μ<sub>w</sub> = mean(e<sub>t−w+1</sub> … e<sub>t</sub>)<br>σ<sub>w</sub> = sample std(e<sub>t−w+1</sub> … e<sub>t</sub>)<br>IR<sub>t</sub> = (μ<sub>w</sub> × √12) / (σ<sub>w</sub> × √12)</div>
+        <p class="note">Default window: 36 months. Additional windows can be added (12, 24, 48, 60).</p>
+    </div>
+
+    <!-- 7. Rolling Tracking Error -->
+    <h2>7. Rolling Tracking Error</h2>
+    <div class="section">
+        <div class="formula">For each rolling window of w months ending at month t:<br>TE<sub>t</sub> = sample std(e<sub>t−w+1</sub> … e<sub>t</sub>) × √12 × 100</div>
+        <p class="note">Default window: 36 months.</p>
+    </div>
+
+    <!-- 8. Rolling 3Y Average Hit Rate -->
+    <h2>8. Rolling 3Y Average Hit Rate</h2>
+    <div class="section">
+        <div class="formula">For each rolling 36-month window ending at month t:<br>Hit Rate<sub>t</sub> = (count of months where e<sub>i</sub> > 0) / (total months in window) × 100<br><br>Rolling 3Y Avg Hit Rate = mean of all Hit Rate<sub>t</sub> values</div>
+        <p class="note">Windows with less than 80% benchmark coverage are excluded.</p>
+    </div>
+
+    <!-- 9. Rolling 3Y Average Information Ratio -->
+    <h2>9. Rolling 3Y Average Information Ratio</h2>
+    <div class="section">
+        <div class="formula">Rolling 3Y Avg IR = mean of all rolling 36-month IR<sub>t</sub> values</div>
+        <p class="note">Uses the same IR formula as Section 6 for each window.</p>
+    </div>
+
+    <!-- 10. Up/Down Capture Ratio (Summary Stats) -->
+    <h2>10. Up/Down Capture Ratio (Summary Statistics)</h2>
+    <div class="section">
+        <p><strong>Up Capture:</strong> Performance in months where benchmark was positive.</p>
+        <div class="formula">Compound Manager Up = Π(1 + r<sub>i</sub>) for all months where b<sub>i</sub> > 0<br>Compound Bmk Up = Π(1 + b<sub>i</sub>) for all months where b<sub>i</sub> > 0<br>Ann. Manager Up = Compound<sup>12/count</sup> − 1<br>Ann. Bmk Up = Compound<sup>12/count</sup> − 1<br>Up Capture = (Ann. Manager Up / Ann. Bmk Up) × 100</div>
+        <p><strong>Down Capture:</strong> Same formula applied to months where b<sub>i</sub> < 0.</p>
+        <p class="note">Requires at least 3 up/down months respectively.</p>
+    </div>
+
+    <!-- 11. Capture Ratio (Multi-Period Chart) -->
+    <h2>11. Capture Ratio (Multi-Period Tile)</h2>
+    <div class="section">
+        <p>Uses sum-of-returns method for selectable periods (1Y, 3Y, 5Y, Inception).</p>
+        <div class="formula">Up Capture = (Σ r<sub>i</sub> for up months) / (Σ b<sub>i</sub> for up months) × 100<br>Down Capture = (Σ r<sub>i</sub> for down months) / (Σ b<sub>i</sub> for down months) × 100<br>Capture Ratio = Up Capture / Down Capture</div>
+        <p class="note">Up months: b<sub>i</sub> ≥ 0. Down months: b<sub>i</sub> < 0. Ratio > 1× indicates favourable asymmetry.</p>
+    </div>
+
+    <!-- 12. Period Returns -->
+    <h2>12. Period Returns (YTD, 1Y, 3Y, 5Y, Since Inception)</h2>
+    <div class="section">
+        <div class="formula">Total Return = Cumul<sub>end</sub> / Cumul<sub>start</sub> − 1<br><br>If period ≤ 12 months: Period Return = Total Return × 100<br>If period > 12 months: Annualised Return = [(1 + Total Return)<sup>1/years</sup> − 1] × 100</div>
+    </div>
+
+    <!-- 13. Cumulative Excess Return -->
+    <h2>13. Cumulative Excess Return</h2>
+    <div class="section">
+        <div class="formula">Excess Cumul<sub>t</sub> = Manager Cumul<sub>t</sub> − Benchmark Cumul<sub>t</sub></div>
+        <p class="note">Difference of cumulative return indices (both starting at 100).</p>
+    </div>
+
+    <!-- 14. Calendar Year Returns -->
+    <h2>14. Calendar Year Returns</h2>
+    <div class="section">
+        <div class="formula">For each calendar year Y:<br>Manager Year Return = [Π(1 + r<sub>i</sub>) − 1] × 100  for all months i in year Y<br>Benchmark Year Return = [Π(1 + b<sub>i</sub>) − 1] × 100  for all months i in year Y</div>
+        <p class="note">Only full-year data or partial years at start/end of the series.</p>
+    </div>
+
+    <!-- 15. Quarterly Performance (Excess) -->
+    <h2>15. Quarterly Performance by Year (Excess Returns)</h2>
+    <div class="section">
+        <div class="formula">Q1 = Jan–Mar, Q2 = Apr–Jun, Q3 = Jul–Sep, Q4 = Oct–Dec<br><br>Qtr Manager Return = [Π(1 + r<sub>i</sub>) − 1] × 100  for months in quarter<br>Qtr Benchmark Return = [Π(1 + b<sub>i</sub>) − 1] × 100  for months in quarter<br>Qtr Excess = Qtr Manager − Qtr Benchmark</div>
+        <p class="note">Only displayed for full quarters (3 months of data required).</p>
+    </div>
+
+    <!-- 16. Drawdown -->
+    <h2>16. Drawdown</h2>
+    <div class="section">
+        <div class="formula">Peak<sub>t</sub> = max(Cumul<sub>0</sub> … Cumul<sub>t</sub>)<br>Drawdown<sub>t</sub> = (Cumul<sub>t</sub> − Peak<sub>t</sub>) / Peak<sub>t</sub> × 100</div>
+        <p class="note">Shown for both manager and benchmark. Always ≤ 0%.</p>
+    </div>
+
+    <!-- 17. Snail Trail -->
+    <h2>17. Snail Trail (3Y Active Risk vs 3Y Excess Return)</h2>
+    <div class="section">
+        <p>Scatter plot of rolling 36-month observations.</p>
+        <div class="formula">For each 36-month window ending at month t:<br><br>Excess Slice: e<sub>i</sub> = r<sub>i</sub> − b<sub>i</sub>  for i in window<br>μ<sub>excess</sub> = mean(excess slice)<br>σ<sub>excess</sub> = sample std(excess slice)<br><br>X-axis (Active Risk) = σ<sub>excess</sub> × √12 × 100<br>Y-axis (Excess Return) = [(1 + μ<sub>excess</sub>)<sup>12</sup> − 1] × 100</div>
+        <p class="note">Points are plotted chronologically with older points more transparent. Trail line connects observations.</p>
+    </div>
+
+    <!-- 18. Quarterly Excess Return Distribution -->
+    <h2>18. Quarterly Excess Return Distribution</h2>
+    <div class="section">
+        <p>Histogram of quarterly excess returns, split by rising/falling benchmark markets.</p>
+        <div class="formula">Qtr Excess = [Π(1 + r<sub>i</sub>) − 1] − [Π(1 + b<sub>i</sub>) − 1]  (× 100, for months in quarter)<br><br>Rising Market: Qtr Benchmark Return ≥ 0<br>Falling Market: Qtr Benchmark Return < 0</div>
+        <p class="note">Dynamic bin width: adapts based on data range (0.5% for narrow, up to 2%+ for wide spreads).</p>
+    </div>
+
+    <!-- 19. Benchmark Returns -->
+    <h2>19. Benchmark Monthly Returns (from MSCI Index Levels)</h2>
+    <div class="section">
+        <div class="formula">Benchmark Return<sub>t</sub> = (Level<sub>t</sub> / Level<sub>t−1</sub>) − 1</div>
+        <p class="note">MSCI index data is stored as price levels. Monthly returns are derived by dividing consecutive levels. Dates are aligned to month-end.</p>
+    </div>
+
+    <div style="margin-top:40px; padding-top:16px; border-top:2px solid #c8d8ec; color:#5a6e84; font-size:12px;">
+        <p>MS Manager Returns Dashboard – Formula Reference | Generated July 2026</p>
+    </div>
+</body>
+</html>
